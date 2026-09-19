@@ -7,6 +7,14 @@ Antigravity (`agy`).
 
 ## Build and try it
 
+Install with Homebrew:
+
+```sh
+brew install hkudligi/tap/rly
+```
+
+Or build from source:
+
 ```sh
 go build ./cmd/rly
 ./rly
