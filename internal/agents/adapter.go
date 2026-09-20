@@ -4,6 +4,7 @@ package agents
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,64 @@ type Installation struct {
 	Error     string `json:"error,omitempty"`
 }
 
+const reserveModelSuffix = "#reserve"
+
+// ModelAvailability is one row in the pre-task agent/model inventory. A nil
+// RemainingPercent is deliberately serialized as null and rendered as UNKNOWN;
+// callers must never infer quota from installation or model availability.
+//
+// Luna and Luna Reserve are different pools. Ordinary catalog rows use the
+// model slug. A reserve fallback is a separate row with Reserve=true; its
+// Model is the execution slug plus "#reserve" so routing can keep them apart
+// while adapters still launch the underlying model.
+type ModelAvailability struct {
+	Agent            string   `json:"agent"`
+	Model            string   `json:"model"`
+	Version          string   `json:"version,omitempty"`
+	Installed        bool     `json:"installed"`
+	Usable           bool     `json:"usable"`
+	Reserve          bool     `json:"reserve,omitempty"`
+	RemainingPercent *float64 `json:"remaining_percent"`
+	Confidence       string   `json:"confidence"`
+	DataSource       string   `json:"data_source"`
+	Error            string   `json:"error,omitempty"`
+}
+
+// ExecutionModel is the provider slug to pass to the agent CLI. Reserve
+// inventory IDs are not real model names.
+func ExecutionModel(model string) string {
+	return strings.TrimSuffix(model, reserveModelSuffix)
+}
+
+// IsReserveModel reports whether an inventory/routing model ID is a reserve pool.
+func IsReserveModel(model string) bool {
+	return strings.HasSuffix(model, reserveModelSuffix)
+}
+
+// ReserveModelID builds a distinct inventory ID for a model's reserve pool.
+func ReserveModelID(executionModel string) string {
+	return executionModel + reserveModelSuffix
+}
+
+const (
+	ConfidenceExact   = "EXACT"
+	ConfidenceUnknown = "UNKNOWN"
+)
+
+// ModelDiscoverer is optional so third-party adapters implementing the
+// original Adapter interface continue to work. The coordinator supplies a
+// conservative UNKNOWN row for adapters that do not implement it.
+type ModelDiscoverer interface {
+	DiscoverModels(context.Context) []ModelAvailability
+}
+
+func UnknownAvailability(installation Installation, source, detail string) ModelAvailability {
+	return ModelAvailability{
+		Agent: installation.Name, Model: "UNKNOWN", Version: installation.Version, Installed: installation.Available,
+		Usable: installation.Available, Confidence: ConfidenceUnknown, DataSource: source, Error: detail,
+	}
+}
+
 type Capabilities struct {
 	NonInteractive   bool `json:"non_interactive"`
 	StructuredOutput bool `json:"structured_output"`
@@ -34,8 +93,11 @@ type Capabilities struct {
 }
 
 type Request struct {
-	Prompt       string
-	Workspace    string
+	Prompt    string
+	Workspace string
+	// Model is the provider model selected by the coordinator. Empty and
+	// UNKNOWN mean use the adapter's default model.
+	Model        string
 	Sandbox      Sandbox
 	SkipGitCheck bool
 }

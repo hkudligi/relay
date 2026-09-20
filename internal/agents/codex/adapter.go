@@ -29,6 +29,9 @@ func (a *Adapter) Start(ctx context.Context, r agents.Request) (agents.Run, erro
 	if r.SkipGitCheck {
 		args = append(args, "--skip-git-repo-check")
 	}
+	if model := agents.ExecutionModel(r.Model); model != "" && model != "UNKNOWN" {
+		args = append(args, "--model", model)
+	}
 	args = append(args, r.Prompt)
 	return start(ctx, a.Command, args, r.Workspace)
 }
@@ -39,6 +42,9 @@ func (a *Adapter) Resume(ctx context.Context, session string, r agents.Request) 
 	args := []string{"exec", "resume", "--json"}
 	if r.SkipGitCheck {
 		args = append(args, "--skip-git-repo-check")
+	}
+	if model := agents.ExecutionModel(r.Model); model != "" && model != "UNKNOWN" {
+		args = append(args, "--model", model)
 	}
 	args = append(args, session, r.Prompt)
 	return start(ctx, a.Command, args, r.Workspace)
@@ -64,7 +70,8 @@ func normalize(line []byte) (agents.Event, bool, error) {
 			Output    int64 `json:"output_tokens"`
 			Reasoning int64 `json:"reasoning_output_tokens"`
 		} `json:"usage"`
-		Error json.RawMessage `json:"error"`
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
 	}
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return agents.Event{}, false, fmt.Errorf("decode codex event: %w", err)
@@ -83,8 +90,29 @@ func normalize(line []byte) (agents.Event, bool, error) {
 		u.TotalTokens = u.InputTokens + u.OutputTokens
 		return agents.Event{Kind: agents.EventResult, Type: raw.Type, Usage: u}, true, nil
 	case "turn.failed", "error":
-		return agents.Event{Kind: agents.EventError, Type: raw.Type, Message: string(raw.Error)}, true, nil
+		message := parseErrorMessage(raw.Error)
+		if message == "" {
+			message = raw.Message
+		}
+		return agents.Event{Kind: agents.EventError, Type: raw.Type, Message: message}, true, nil
 	default:
 		return agents.Event{Kind: agents.EventProgress, Type: raw.Type}, raw.Type != "", nil
 	}
+}
+
+func parseErrorMessage(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var msgObj struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &msgObj); err == nil && msgObj.Message != "" {
+		return msgObj.Message
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err == nil && str != "" {
+		return str
+	}
+	return string(raw)
 }

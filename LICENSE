@@ -1,0 +1,79 @@
+RLY FREE USE LICENSE
+Apache-2.0-Inspired Custom License
+
+Copyright (c) 2026 rly contributors
+
+1. Grant of Permission
+
+Subject to the restrictions in Section 2, permission is hereby granted, free of
+charge, to any person obtaining a copy of this software and associated
+documentation files (the "Software"), to use, copy, modify, merge, publish,
+distribute, and sublicense the Software, including for commercial purposes.
+
+You may make the Software available in source or compiled form, provided that
+you retain this license notice and the following attribution in all copies or
+substantial portions of the Software:
+
+    This product includes software from the rly project.
+
+2. Restrictions on Automated Collection and Reuse
+
+Without the prior written consent of the copyright holders, you may not use any
+robot, spider, crawler, scraper, bot, autonomous agent, generative-AI agent,
+language model, data-mining system, or other automated or semi-automated means
+to access, crawl, scrape, harvest, copy, extract, mirror, index, ingest,
+reproduce, adapt, train on, redistribute, or otherwise reuse the Software or
+any substantial portion of it. This restriction applies whether the activity
+is performed directly or through an intermediary, and whether the resulting
+material is distributed publicly or privately.
+
+Human-directed use of the Software under Section 1 is permitted. Automated
+security testing, accessibility tooling, package-management tooling, and
+ordinary operation of the Software are permitted only to the extent reasonably
+necessary for those purposes and do not grant permission to collect or reuse
+the Software beyond that use.
+
+3. Preservation of Notices
+
+Any redistribution of the Software must include this license and preserve all
+existing copyright, attribution, patent, trademark, and other proprietary
+notices. Modified files must carry prominent notices stating that they were
+changed.
+
+4. Trademarks
+
+This license does not grant permission to use the trade names, trademarks,
+service marks, or product names of the copyright holders, except as required
+for reasonable and customary description of the origin of the Software.
+
+5. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. YOU USE THE SOFTWARE
+ENTIRELY AT YOUR OWN RISK. THE DEVELOPER AND COPYRIGHT HOLDERS DO NOT WARRANT
+THAT THE SOFTWARE WILL BE ACCURATE, RELIABLE, SECURE, ERROR-FREE, AVAILABLE,
+OR SUITABLE FOR YOUR NEEDS, OR THAT IT WILL OPERATE WITHOUT INTERRUPTION OR
+LOSS OF DATA.
+
+6. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+DEVELOPER, COPYRIGHT HOLDERS, OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, CONSEQUENTIAL, OR OTHER DAMAGES,
+INCLUDING LOSS OF PROFITS, DATA, BUSINESS, OR GOODWILL, ARISING FROM OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR INABILITY TO USE THE SOFTWARE,
+REGARDLESS OF THE THEORY OF LIABILITY AND EVEN IF ADVISED OF THE POSSIBILITY
+OF SUCH DAMAGE. THE DEVELOPER ASSUMES NO LIABILITY WHATSOEVER FOR YOUR USE
+OF, OR RELIANCE ON, THE SOFTWARE.
+
+7. Termination
+
+This license and the permissions granted under it terminate automatically if
+you violate its terms. Permissions for recipients who comply with this license
+will not terminate solely because another party violated it.
+
+8. Acceptance
+
+By using, copying, modifying, or distributing the Software, you accept this
+license and agree to comply with its terms.

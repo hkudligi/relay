@@ -412,6 +412,14 @@ QuotaState
 
 The tracker records observations and estimated consumption for each run. When exact usage is unavailable, estimates use input size, output size, elapsed work, and historical adapter behavior. Estimated quota must never be displayed as exact.
 
+Before a task enters planning, the coordinator inventories every configured
+agent/model pair. Each row records installation and usability, an optional
+remaining percentage, confidence, and its data source. Provider-reported quota
+windows may be displayed as exact; if no exact percentage is exposed, the CLI,
+REPL, and JSON output use `UNKNOWN`/`null` and retain the source and diagnostic.
+The complete inventory is persisted in an `agent.inventory_discovered` trace
+event before the `PLANNING` state transition.
+
 Policies include:
 
 - Minimum reserve per agent.

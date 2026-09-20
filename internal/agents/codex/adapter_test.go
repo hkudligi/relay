@@ -58,3 +58,24 @@ func TestResumeRequiresSession(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestStartPreservesUsageLimitError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "codex")
+	script := `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'codex-cli 9.9.9'; exit 0; fi
+printf '%s\n' '{"type":"turn.failed","message":"You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 22nd, 2026 3:36 PM."}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run, err := codex.New(path).Start(context.Background(), agents.Request{Prompt: "work", Workspace: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range run.Events() {
+	}
+	result := run.Wait()
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "usage limit") {
+		t.Fatalf("result = %+v", result)
+	}
+}

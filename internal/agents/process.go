@@ -36,6 +36,7 @@ func startProcess(parent context.Context, command string, args []string, dir str
 	ctx, cancel := context.WithCancel(parent)
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
+	cmd.Stdin = bytes.NewReader(nil)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -92,6 +93,13 @@ func collectProcess(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Reader
 		}
 		if event.Kind == EventError && event.Message != "" {
 			result.Err = errors.New(event.Message)
+			// Provider failures such as quota exhaustion are terminal. Some
+			// CLIs (notably agy) report the failure but keep their language
+			// server/session alive, so waiting for normal process exit can add
+			// a large and needless delay.
+			events <- event
+			_ = cmd.Process.Kill()
+			break
 		}
 		if event.Kind == EventResult {
 			sawResult = true
@@ -99,7 +107,8 @@ func collectProcess(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Reader
 				result.Response = event.Message
 			}
 			result.Usage = event.Usage
-			result.Err = nil
+			// Preserve an earlier provider error. Some CLIs emit a terminal
+			// result after reporting a failed turn (notably on quota errors).
 		}
 		events <- event
 	}

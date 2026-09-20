@@ -93,6 +93,15 @@ CREATE TABLE IF NOT EXISTS runs (
   completed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_task_started ON runs(task_id, started_at);
+CREATE TABLE IF NOT EXISTS project_memory (
+  repository TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  source_task_id TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(repository, key)
+);
+CREATE INDEX IF NOT EXISTS project_memory_repo_updated ON project_memory(repository, updated_at DESC);
 `)
 	if err != nil {
 		return fmt.Errorf("migrate state: %w", err)
@@ -272,6 +281,46 @@ func (s *SQLite) Events(ctx context.Context, taskID string) ([]model.Event, erro
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLite) ProjectMemory(ctx context.Context, repository string) ([]model.ProjectMemory, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT repository,key,value,source_task_id,updated_at FROM project_memory WHERE repository=? ORDER BY key`, repository)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.ProjectMemory
+	for rows.Next() {
+		var item model.ProjectMemory
+		var updated string
+		if err := rows.Scan(&item.Repository, &item.Key, &item.Value, &item.SourceTaskID, &updated); err != nil {
+			return nil, err
+		}
+		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ApplyMemory applies a complete memory update atomically. Upserts replace
+// prior values with the same repository/key pair; deletes are idempotent.
+func (s *SQLite) ApplyMemory(ctx context.Context, repository, sourceTaskID string, update model.MemoryUpdate, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, key := range update.Delete {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM project_memory WHERE repository=? AND key=?`, repository, key); err != nil {
+			return err
+		}
+	}
+	for _, item := range update.Upsert {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO project_memory(repository,key,value,source_task_id,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(repository,key) DO UPDATE SET value=excluded.value,source_task_id=excluded.source_task_id,updated_at=excluded.updated_at`, repository, item.Key, item.Value, sourceTaskID, stamp(updatedAt)); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }

@@ -35,6 +35,9 @@ func (a *Adapter) Resume(ctx context.Context, session string, r agents.Request) 
 }
 func (a *Adapter) run(ctx context.Context, session string, r agents.Request) (agents.Run, error) {
 	args := []string{"-p", r.Prompt, "--output-format", "stream-json"}
+	if model := agents.ExecutionModel(r.Model); model != "" && model != "UNKNOWN" {
+		args = append(args, "--model", model)
+	}
 	if session != "" {
 		args = append(args, "--conversation", session)
 	}
