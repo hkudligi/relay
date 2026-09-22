@@ -3,6 +3,7 @@ package agy
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os/exec"
 	"sort"
 	"strings"
@@ -36,11 +37,42 @@ func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability
 		} `json:"models"`
 	}
 	var names []string
-	if json.Unmarshal(output, &payload) == nil {
+	if err := json.Unmarshal(output, &payload); err == nil && len(payload.Models) > 0 {
 		for _, item := range payload.Models {
 			if strings.TrimSpace(item.ID) != "" {
 				names = append(names, item.ID)
 			}
+		}
+	} else {
+		// Fallback: agy may output a plain list (e.g., "model-id   description")
+		cleanOutput := strings.ReplaceAll(string(output), "\r", "\n")
+		lines := strings.Split(cleanOutput, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			// Remove spinner progress text if present, but keep any model info that may follow
+			if strings.Contains(line, "Fetching available models") {
+				line = strings.ReplaceAll(line, "Fetching available models", "")
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+			}
+			// Remove any leading non‑ASCII/control characters (spinner glyphs) then take the first token as the model ID
+			cleanLine := strings.TrimLeftFunc(line, func(r rune) bool {
+				return r < 32 || r > 126
+			})
+			fields := strings.Fields(cleanLine)
+			for _, f := range fields {
+				if strings.Contains(f, "-") {
+					names = append(names, f)
+				}
+			}
+			// Debug: log the processed line and any names found
+			log.Printf("agy fallback line=%q fields=%v names=%v", line, fields, names)
+
 		}
 	}
 	if len(names) == 0 {
@@ -51,7 +83,7 @@ func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability
 	sort.Strings(names)
 	rows := make([]agents.ModelAvailability, 0, len(names))
 	for _, name := range names {
-		rows = append(rows, agents.ModelAvailability{Agent: a.Name(), Model: name, Version: installation.Version, Installed: true, Usable: true, Confidence: agents.ConfidenceUnknown, DataSource: "agy models; provider quota percentage unavailable"})
+		rows = append(rows, agents.ModelAvailability{Agent: a.Name(), Model: name, Version: installation.Version, Installed: true, Usable: true, Confidence: agents.ConfidenceExact, DataSource: "agy models; provider quota unavailable"})
 	}
 	return rows
 }

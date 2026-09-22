@@ -17,6 +17,7 @@ import (
 	"github.com/harsha/relay/internal/agents/agy"
 	"github.com/harsha/relay/internal/agents/codex"
 	"github.com/harsha/relay/internal/agents/cursor"
+	"github.com/harsha/relay/internal/agents/freebuff"
 	"github.com/harsha/relay/internal/core"
 	"github.com/harsha/relay/internal/model"
 	"github.com/harsha/relay/internal/store"
@@ -46,7 +47,7 @@ type runOutput struct {
 }
 
 func New() *App {
-	return &App{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Getwd: os.Getwd, HomeDir: os.UserHomeDir, Adapters: map[string]agents.Adapter{"codex": codex.New(""), "agy": agy.New(""), "cursor": cursor.New("")}}
+	return &App{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Getwd: os.Getwd, HomeDir: os.UserHomeDir, Adapters: map[string]agents.Adapter{"codex": codex.New(""), "agy": agy.New(""), "cursor": cursor.New(""), "freebuff": freebuff.New("")}}
 }
 
 func (a *App) Run(ctx context.Context, args []string) int {
@@ -99,8 +100,8 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		fs := flag.NewFlagSet("run", flag.ContinueOnError)
 		fs.SetOutput(a.Err)
 		jsonOut := fs.Bool("json", false, "emit JSON")
-		agentName := fs.String("agent", "auto", "agent adapter (codex, agy, cursor, or auto)")
-		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, or auto)")
+		agentName := fs.String("agent", "auto", "agent adapter (codex, agy, cursor, freebuff, or auto)")
+		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, freebuff, or auto)")
 		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy (balanced, conservative, or quality-first)")
 		minReserve := fs.Float64("min-reserve", 15.0, "minimum token reserve percentage")
 		sandbox := fs.String("sandbox", string(agents.SandboxWorkspaceWrite), "sandbox mode (read-only or workspace-write)")
@@ -478,7 +479,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 func (a *App) discoverInventory(ctx context.Context) []agents.ModelAvailability {
 	names := make([]string, 0, len(a.Adapters))
 	seen := make(map[string]bool, len(a.Adapters))
-	for _, name := range []string{"codex", "agy", "cursor"} {
+	for _, name := range []string{"codex", "agy", "cursor", "freebuff"} {
 		if _, ok := a.Adapters[name]; ok {
 			names = append(names, name)
 			seen[name] = true
@@ -664,7 +665,7 @@ func (a *App) help() {
 
 Usage:
   rly [--state PATH]
-  rly [--state PATH] run [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--sandbox MODE] [--json] <objective>
+  rly [--state PATH] run [--planner codex|agy|cursor|freebuff|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--sandbox MODE] [--json] <objective>
   rly [--state PATH] agents [--json]
   rly [--state PATH] status [--json]
   rly [--state PATH] tasks [--json]

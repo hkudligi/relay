@@ -1,8 +1,8 @@
 # rly
 `rly` is a local conversational runtime for coordinating coding-agent CLIs. The
 current Phase 1 slice includes a repository-aware CLI/REPL, durable SQLite task
-state, durable project memory, an append-only trace, and streaming adapters for Codex, Cursor (`agent` / `cursor-agent`), and Google
-Antigravity (`agy`).
+state, durable project memory, an append-only trace, and streaming adapters for Codex, Cursor (`agent` / `cursor-agent`), Google
+Antigravity (`agy`), and Freebuff (`freebuff`).
 
 ## Build and try it
 
@@ -25,6 +25,7 @@ Useful commands:
 ./rly run "fix the flaky test"
 ./rly run --agent cursor "review the current package"
 ./rly run --planner cursor --agent agy "implement the planned feature"
+./rly run --agent freebuff "add a lint rule and fix violations"
 ./rly agents
 ./rly agents --json
 ./rly status
@@ -70,8 +71,8 @@ installed and usable, its remaining availability percentage, a confidence
 label, and the data source. Codex percentages come from
 `account/rateLimits/read`; when multiple provider windows apply, the displayed
 number is the lowest remaining percentage. If a provider does not expose an
-exact percentage, `rly` prints `UNKNOWN` rather than estimating one. `agy`
-and Cursor currently fall into this category.
+exact percentage, `rly` prints `UNKNOWN` rather than estimating one. `agy`,
+Cursor, and Freebuff currently fall into this category.
 
 The inventory is recorded as the `agent.inventory_discovered` event before the
 task's `PLANNING` transition. `rly trace --json <task-id>` returns the full
@@ -118,11 +119,50 @@ cancellation. Use `--sandbox read-only` for analysis-only tasks; mutation tasks
 default to `workspace-write`. `rly run` returns exit code `4` when the selected CLI
 is not installed or cannot report its version.
 
+### Freebuff adapter
+
+The Freebuff CLI is a terminal UI with no headless mode: release 0.0.183 accepts
+no prompt argument and exposes no `--print` or `--output-format` flags. `rly`
+drives it over a pseudo-terminal and moves all machine-readable communication
+into temporary markdown files inside the workspace:
+
+```text
+.rly/freebuff/run-<id>/prompt.md   task brief written by rly
+.rly/freebuff/run-<id>/status.md   progress lines appended by the agent
+.rly/freebuff/run-<id>/result.md   final response written by the agent
+```
+
+`rly` writes the full task brief (objective, project memory, memory-update
+contract, and the reporting protocol) to `prompt.md`, pastes a one-line pointer
+at that file into the TUI, tails `status.md` as the streamed progress channel,
+and treats `result.md` as the terminal answer. Runs are tracked with a
+`freebuff:<channel-dir>` session identifier; sessions are not resumable, and
+the channel directory is unique per run so concurrent tasks never collide.
+Because the free tier exposes no quota surface, its inventory contains the
+published Freebuff model IDs with `remaining=UNKNOWN`; quota remains denied by
+the default routing policy unless another measured provider fails first, in
+which case Freebuff participates in recovery routing.
+
 To use two agents for one task, pass `--planner codex --agent agy` (or `--planner auto --agent auto`). Codex
 inspects the repository in read-only mode and produces an implementation plan;
 that plan is then included in the prompt sent to `agy`, which performs the
 workspace changes. Both runs are persisted under the same task and appear in
 `rly trace <task-id>`.
+
+### Multi-process orchestration
+
+The reusable `core.Orchestrator` schedules a dependency graph of agent tasks.
+It supports `auto`, `sequential`, and `parallel` modes, configurable maximum
+parallelism, and event streaming through an `EventSink`. In `auto` mode, ready
+read-only tasks run concurrently; tasks that can modify the workspace are
+always isolated and run one at a time. Dependencies are honored in every mode,
+and a failed task cancels the orchestration and prevents dependent tasks from
+starting.
+
+This provides safe fan-out for independent analysis or review agents while
+keeping implementation and other workspace-mutating processes serialized.
+Adapters are injected into the orchestrator, so the scheduler remains
+vendor-neutral.
 
 ## Token availability & efficacy routing
 

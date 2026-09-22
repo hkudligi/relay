@@ -166,7 +166,7 @@ func evaluateCandidate(
 	}
 
 	// 1. Token / Quota evaluation
-	quotaHeadroom, remainingPercent, confidence, quotaEligible, exclusion := evaluateQuota(modelRows, policy)
+	quotaHeadroom, remainingPercent, confidence, quotaEligible, exclusion := evaluateQuota(name, modelRows, policy)
 	score.QuotaHeadroom = quotaHeadroom
 	score.RemainingPercent = remainingPercent
 	score.QuotaConfidence = confidence
@@ -198,10 +198,16 @@ func evaluateCandidate(
 	return score
 }
 
-func evaluateQuota(rows []agents.ModelAvailability, policy RoutingPolicy) (float64, *float64, string, bool, string) {
+func evaluateQuota(agent string, rows []agents.ModelAvailability, policy RoutingPolicy) (float64, *float64, string, bool, string) {
 	if len(rows) == 0 {
 		switch policy.UnknownQuota {
 		case "deny":
+			// Freebuff publishes named models but exposes no quota API. Treat that
+			// catalog as routable with unknown headroom; an actual UNKNOWN row is
+			// still denied, as are other providers without measured quota.
+			if agent == "freebuff" && hasNamedUsableModel(rows) {
+				return 0.80, nil, agents.ConfidenceUnknown, true, ""
+			}
 			return 0, nil, agents.ConfidenceUnknown, false, "unknown quota denied by policy"
 		case "conservative":
 			return 0.50, nil, agents.ConfidenceUnknown, true, ""
@@ -214,6 +220,7 @@ func evaluateQuota(rows []agents.ModelAvailability, policy RoutingPolicy) (float
 	var sawExactZero bool
 	var bestRemaining *float64
 	var bestReserveRemaining *float64
+	bestRemainingIsReserve := false
 	confidence := agents.ConfidenceUnknown
 
 	for _, r := range rows {
@@ -251,6 +258,7 @@ func evaluateQuota(rows []agents.ModelAvailability, policy RoutingPolicy) (float
 
 	if bestRemaining == nil {
 		bestRemaining = bestReserveRemaining
+		bestRemainingIsReserve = bestRemaining != nil
 	}
 
 	if bestRemaining != nil {
@@ -258,8 +266,15 @@ func evaluateQuota(rows []agents.ModelAvailability, policy RoutingPolicy) (float
 		if rem <= 0.0 {
 			return 0, bestRemaining, confidence, false, "token quota exhausted (0% remaining)"
 		}
-		if rem < policy.MinReservePercent && policy.Strategy != StrategyQualityFirst {
+		// The configured reserve threshold protects ordinary quota. A reserve
+		// bucket is already the fallback pool, so any positive balance must
+		// remain eligible; otherwise Relay can report Codex unavailable while
+		// Codex Reserve is still usable.
+		if rem < policy.MinReservePercent && !bestRemainingIsReserve && policy.Strategy != StrategyQualityFirst {
 			return 0.10, bestRemaining, confidence, false, "remaining quota below reserve threshold"
+		}
+		if bestRemainingIsReserve && rem < policy.MinReservePercent {
+			return 0.10, bestRemaining, confidence, true, ""
 		}
 		headroom := (rem - policy.MinReservePercent) / (100.0 - policy.MinReservePercent)
 		if headroom < 0 {
@@ -277,12 +292,27 @@ func evaluateQuota(rows []agents.ModelAvailability, policy RoutingPolicy) (float
 
 	switch policy.UnknownQuota {
 	case "deny":
+		// Freebuff publishes named models but exposes no quota API. Treat that
+		// catalog as routable with unknown headroom; an actual UNKNOWN row is
+		// still denied, as are other providers without measured quota.
+		if agent == "freebuff" && hasNamedUsableModel(rows) {
+			return 0.80, nil, agents.ConfidenceUnknown, true, ""
+		}
 		return 0, nil, agents.ConfidenceUnknown, false, "unknown quota denied by policy"
 	case "conservative":
 		return 0.50, nil, agents.ConfidenceUnknown, true, ""
 	default:
 		return 0.80, nil, agents.ConfidenceUnknown, true, ""
 	}
+}
+
+func hasNamedUsableModel(rows []agents.ModelAvailability) bool {
+	for _, row := range rows {
+		if row.Usable && strings.TrimSpace(row.Model) != "" && row.Model != "UNKNOWN" {
+			return true
+		}
+	}
+	return false
 }
 
 func selectModel(rows []agents.ModelAvailability) string {
@@ -340,6 +370,8 @@ func IsQuotaExhaustedMessage(msg string) bool {
 		"429",
 		"purchase more credits",
 		"upgrade to pro",
+		"daily session limit",
+		"out of sessions",
 	}
 	for _, p := range patterns {
 		if strings.Contains(msg, p) {
@@ -360,6 +392,8 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 			base = 0.96
 		} else if strings.Contains(agentLower, "cursor") {
 			base = 0.92
+		} else if strings.Contains(agentLower, "freebuff") {
+			base = 0.90
 		} else if strings.Contains(agentLower, "codex") {
 			base = 0.88
 		}
@@ -371,6 +405,8 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 			base = 0.96
 		} else if strings.Contains(agentLower, "cursor") {
 			base = 0.94
+		} else if strings.Contains(agentLower, "freebuff") {
+			base = 0.92
 		} else if strings.Contains(agentLower, "agy") {
 			base = 0.90
 		}
@@ -385,6 +421,8 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 			base = 0.93
 		} else if strings.Contains(agentLower, "cursor") {
 			base = 0.92
+		} else if strings.Contains(agentLower, "freebuff") {
+			base = 0.91
 		} else if strings.Contains(agentLower, "codex") {
 			base = 0.90
 		}
@@ -393,6 +431,8 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 			base = 0.94
 		} else if strings.Contains(agentLower, "cursor") {
 			base = 0.93
+		} else if strings.Contains(agentLower, "freebuff") {
+			base = 0.91
 		} else if strings.Contains(agentLower, "codex") {
 			base = 0.90
 		}
@@ -401,6 +441,8 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 			base = 0.92
 		} else if strings.Contains(agentLower, "cursor") {
 			base = 0.91
+		} else if strings.Contains(agentLower, "freebuff") {
+			base = 0.90
 		} else if strings.Contains(agentLower, "agy") {
 			base = 0.90
 		}

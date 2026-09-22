@@ -71,6 +71,23 @@ func TestRouteSelectsAgentWithAvailableTokensOverExhausted(t *testing.T) {
 	}
 }
 
+func TestRouteSelectsNamedFreebuffModelWithUnknownQuotaByDefault(t *testing.T) {
+	adapters := map[string]agents.Adapter{
+		"freebuff": &mockAdapter{name: "freebuff", available: true, caps: agents.Capabilities{FileEditing: true}},
+	}
+	inventory := []agents.ModelAvailability{
+		{Agent: "freebuff", Model: "deepseek/deepseek-v4-flash", Installed: true, Usable: true, Confidence: agents.ConfidenceUnknown},
+		{Agent: "freebuff", Model: "z-ai/glm-5.3-flash", Installed: true, Usable: true, Confidence: agents.ConfidenceUnknown},
+	}
+	decision, err := core.Route(context.Background(), core.RoleImplementation, "fix it", adapters, inventory, "", core.DefaultRoutingPolicy())
+	if err != nil {
+		t.Fatalf("unexpected route error: %v", err)
+	}
+	if decision.SelectedAgent != "freebuff" || decision.SelectedModel == "" || decision.SelectedModel == "UNKNOWN" {
+		t.Fatalf("selected = %s/%q, want a named Freebuff model", decision.SelectedAgent, decision.SelectedModel)
+	}
+}
+
 func TestRouteDeniesUnknownQuotaByDefault(t *testing.T) {
 	quota := 54.0
 	adapters := map[string]agents.Adapter{
@@ -88,6 +105,28 @@ func TestRouteDeniesUnknownQuotaByDefault(t *testing.T) {
 	}
 	if decision.SelectedAgent != "codex" {
 		t.Fatalf("selected agent = %s, want codex", decision.SelectedAgent)
+	}
+}
+
+func TestRouteKeepsPositiveReserveQuotaEligibleBelowNormalThreshold(t *testing.T) {
+	ordinary := 0.0
+	reserve := 7.0
+	adapters := map[string]agents.Adapter{
+		"codex": &mockAdapter{name: "codex", available: true, caps: agents.Capabilities{FileEditing: true}},
+		"agy":   &mockAdapter{name: "agy", available: true, caps: agents.Capabilities{FileEditing: true}},
+	}
+	inventory := []agents.ModelAvailability{
+		{Agent: "codex", Model: "gpt-5.6-luna", Installed: true, Usable: false, RemainingPercent: &ordinary, Confidence: agents.ConfidenceExact},
+		{Agent: "codex", Model: "gpt-reserve", Installed: true, Usable: true, Reserve: true, RemainingPercent: &reserve, Confidence: agents.ConfidenceExact},
+		{Agent: "agy", Model: "UNKNOWN", Installed: true, Usable: true, Confidence: agents.ConfidenceUnknown},
+	}
+
+	decision, err := core.Route(context.Background(), core.RoleImplementation, "create a file", adapters, inventory, "", core.DefaultRoutingPolicy())
+	if err != nil {
+		t.Fatalf("unexpected route error: %v", err)
+	}
+	if decision.SelectedAgent != "codex" || decision.SelectedModel != "gpt-reserve" {
+		t.Fatalf("selected %s/%s, want codex/gpt-reserve", decision.SelectedAgent, decision.SelectedModel)
 	}
 }
 
