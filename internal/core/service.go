@@ -237,15 +237,149 @@ func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Ada
 	return &PlanResult{Task: task, Result: result}, nil
 }
 
-// ExecuteWithPlan runs a read-only planner and then sends its output to the
-// executor. The executor remains responsible for the actual implementation.
+// ExecuteWithPlan builds a two-agent orchestration graph: a read-only planner
+// produces context, then a workspace-writing executor consumes it.
 func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner, executor agents.Adapter, plannerModel string, request agents.Request, emitPlan, emitExecution func(agents.Event)) (*Execution, error) {
-	plan, err := s.Plan(ctx, task, planner, plannerModel, emitPlan)
+	plannerInstallation := planner.Detect(ctx)
+	if !plannerInstallation.Available {
+		summary := fmt.Sprintf("%s adapter unavailable", planner.Name())
+		if plannerInstallation.Error != "" {
+			summary += ": " + plannerInstallation.Error
+		}
+		_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.unavailable", Actor: "coordinator", Summary: summary, CreatedAt: s.now().UTC()})
+		return nil, fmt.Errorf("%w: %s", ErrAgentUnavailable, summary)
+	}
+	executorInstallation := executor.Detect(ctx)
+	if !executorInstallation.Available {
+		summary := fmt.Sprintf("%s adapter unavailable", executor.Name())
+		if executorInstallation.Error != "" {
+			summary += ": " + executorInstallation.Error
+		}
+		_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.unavailable", Actor: "coordinator", Summary: summary, CreatedAt: s.now().UTC()})
+		return nil, fmt.Errorf("%w: %s", ErrAgentUnavailable, summary)
+	}
+	memory, err := s.store.ProjectMemory(ctx, task.Repository)
+	if err != nil {
+		return nil, fmt.Errorf("load project memory: %w", err)
+	}
+
+	_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "planning.started", Actor: planner.Name(), Summary: fmt.Sprintf("planner → %s", planner.Name()), Data: map[string]any{"adapter": planner.Name(), "version": plannerInstallation.Version}, CreatedAt: s.now().UTC()})
+	currentTask, err := s.store.Task(ctx, task.ID)
 	if err != nil {
 		return nil, err
 	}
-	request.Prompt = task.Objective + "\n\nImplementation plan from " + planner.Name() + ":\n" + plan.Result.Response
-	return s.Execute(ctx, task, executor, request, emitExecution)
+	fromState := currentTask.State
+	if fromState != model.TaskPlanning && fromState != model.TaskFailed && fromState != model.TaskCreated {
+		fromState = model.TaskPlanning
+	}
+	if err := s.transition(ctx, task.ID, fromState, model.TaskRunning, "orchestrator", fmt.Sprintf("orchestrator → %s → %s", planner.Name(), executor.Name()), map[string]any{"planner": planner.Name(), "executor": executor.Name(), "planner_version": plannerInstallation.Version, "executor_version": executorInstallation.Version}); err != nil {
+		return nil, err
+	}
+
+	request.Workspace = task.Repository
+	request.Prompt = composePrompt(task.Objective, memory)
+	orchestrator := Orchestrator{
+		Adapters: map[string]agents.Adapter{
+			"planner":  sanitizedPlannerAdapter{Adapter: planner},
+			"executor": executor,
+		},
+		Mode: ExecutionSequential,
+		OnEvent: func(agentTask AgentTask, event agents.Event) {
+			if agentTask.ID == "plan" {
+				if event.Kind == agents.EventMessage {
+					event.Message, _ = parseMemoryUpdate(event.Message)
+				}
+				if emitPlan != nil {
+					emitPlan(event)
+				}
+				switch event.Kind {
+				case agents.EventSession:
+					_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.session_started", Actor: planner.Name(), Summary: "session " + event.SessionID + " started", Data: map[string]any{"session_id": event.SessionID, "role": "planner"}, CreatedAt: s.now().UTC()})
+				case agents.EventError:
+					_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.error", Actor: planner.Name(), Summary: event.Message, CreatedAt: s.now().UTC()})
+				}
+				return
+			}
+			if event.Kind == agents.EventMessage {
+				event.Message, _ = parseMemoryUpdate(event.Message)
+			}
+			if emitExecution != nil {
+				emitExecution(event)
+			}
+			switch event.Kind {
+			case agents.EventSession:
+				_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.session_started", Actor: executor.Name(), Summary: "session " + event.SessionID + " started", Data: map[string]any{"session_id": event.SessionID}, CreatedAt: s.now().UTC()})
+			case agents.EventError:
+				_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.error", Actor: executor.Name(), Summary: event.Message, CreatedAt: s.now().UTC()})
+			}
+		},
+	}
+	orchestration, runErr := orchestrator.Run(ctx, []AgentTask{
+		{ID: "plan", Agent: "planner", Request: agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: plannerModel, Sandbox: agents.SandboxReadOnly}, ReadOnly: true},
+		{ID: "execute", Agent: "executor", Request: request, DependsOn: []string{"plan"}, ReadOnly: false},
+	})
+	var planResult, execResult *AgentTaskResult
+	for i := range orchestration.Results {
+		result := &orchestration.Results[i]
+		switch result.TaskID {
+		case "plan":
+			planResult = result
+		case "execute":
+			execResult = result
+		}
+	}
+	if planResult != nil {
+		if err := s.recordAgentRun(ctx, task, planner.Name(), *planResult); err != nil {
+			return nil, err
+		}
+		if planResult.Result.Err != nil {
+			if IsQuotaExhausted(planResult.Result.Err) {
+				_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.quota_exhausted", Actor: planner.Name(), Summary: fmt.Sprintf("%s token quota exhausted: %s", planner.Name(), planResult.Result.Err.Error()), Data: map[string]any{"adapter": planner.Name(), "error": planResult.Result.Err.Error()}, CreatedAt: s.now().UTC()})
+			}
+			_ = s.transition(ctx, task.ID, model.TaskRunning, model.TaskFailed, planner.Name(), "planner failed: "+planResult.Result.Err.Error(), nil)
+			return &Execution{Task: task, Result: planResult.Result}, planResult.Result.Err
+		}
+	}
+	if execResult == nil {
+		if runErr == nil {
+			runErr = fmt.Errorf("%w: executor did not run", ErrOrchestrationFailed)
+		}
+		s.failExecution(ctx, task.ID, executor.Name(), runErr)
+		return nil, runErr
+	}
+	cleanResponse, memoryUpdate := parseMemoryUpdate(execResult.Result.Response)
+	execResult.Result.Response = cleanResponse
+	if err := s.recordAgentRun(ctx, task, executor.Name(), *execResult); err != nil {
+		return nil, err
+	}
+	state := model.TaskCompleted
+	if execResult.Result.Err != nil {
+		state = model.TaskFailed
+		if IsQuotaExhausted(execResult.Result.Err) {
+			_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.quota_exhausted", Actor: executor.Name(), Summary: fmt.Sprintf("%s token quota exhausted: %s", executor.Name(), execResult.Result.Err.Error()), Data: map[string]any{"adapter": executor.Name(), "error": execResult.Result.Err.Error()}, CreatedAt: s.now().UTC()})
+		}
+	} else if len(memoryUpdate.Upsert) > 0 || len(memoryUpdate.Delete) > 0 {
+		if err := s.store.ApplyMemory(ctx, task.Repository, task.ID, memoryUpdate, execResult.CompletedAt); err != nil {
+			return nil, fmt.Errorf("update project memory: %w", err)
+		}
+		keys := memoryUpdateKeys(memoryUpdate)
+		_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "project_memory.updated", Actor: executor.Name(), Summary: "updated project memory: " + strings.Join(keys, ", "), Data: map[string]any{"keys": keys}, CreatedAt: execResult.CompletedAt})
+	}
+	summary := fmt.Sprintf("%s completed the task", executor.Name())
+	if execResult.Result.Err != nil {
+		summary = fmt.Sprintf("%s failed: %v", executor.Name(), execResult.Result.Err)
+	}
+	if err := s.transition(ctx, task.ID, model.TaskRunning, state, executor.Name(), summary, map[string]any{"session_id": execResult.Result.SessionID, "exit_code": execResult.Result.ExitCode, "total_tokens": execResult.Result.Usage.TotalTokens}); err != nil {
+		return nil, err
+	}
+	updatedTask, _ := s.store.Task(ctx, task.ID)
+	if runErr != nil && execResult.Result.Err == nil {
+		return &Execution{Task: updatedTask, Result: execResult.Result}, runErr
+	}
+	if execResult.Result.Err != nil {
+		return &Execution{Task: updatedTask, Result: execResult.Result}, execResult.Result.Err
+	}
+	return &Execution{Task: updatedTask, Result: execResult.Result}, nil
 }
 
 func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.Adapter, request agents.Request, emit func(agents.Event)) (*Execution, error) {
@@ -370,7 +504,7 @@ func composePrompt(objective string, memory []model.ProjectMemory) string {
 }
 
 func composePlanPrompt(objective string, memory []model.ProjectMemory) string {
-	return composePrompt(objective, memory) + "\n\nYou are the planning specialist. Analyze the repository and produce a concrete, ordered implementation plan for another agent. Do not edit files, do not execute the implementation, and do not include a <rly-memory> block."
+	return composePrompt(objective, memory) + "\n\nYou are the planning specialist. This is a read-only analysis phase. Analyze the repository and produce a concrete, ordered implementation plan for another agent. Do not edit files, do not run implementation commands, do not verify by attempting the requested change, and do not claim that you created or changed anything. If the objective asks for implementation, describe the exact commands or edits the executor should perform instead. Do not include a <rly-memory> block."
 }
 
 func parseMemoryUpdate(response string) (string, model.MemoryUpdate) {
@@ -445,6 +579,62 @@ func memoryUpdateKeys(update model.MemoryUpdate) []string {
 	keys = append(keys, update.Delete...)
 	sort.Strings(keys)
 	return keys
+}
+
+func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, adapter string, result AgentTaskResult) error {
+	status := "COMPLETED"
+	if result.Result.Err != nil || result.Error != "" || result.Skipped {
+		status = "FAILED"
+	}
+	return s.store.RecordRun(ctx, model.RunRecord{
+		ID:          newID("run"),
+		TaskID:      task.ID,
+		Adapter:     adapter,
+		SessionID:   result.Result.SessionID,
+		Status:      status,
+		ExitCode:    result.Result.ExitCode,
+		Response:    result.Result.Response,
+		Usage:       map[string]any{"input_tokens": result.Result.Usage.InputTokens, "cached_tokens": result.Result.Usage.CachedTokens, "output_tokens": result.Result.Usage.OutputTokens, "reasoning_tokens": result.Result.Usage.ReasoningTokens, "total_tokens": result.Result.Usage.TotalTokens},
+		StartedAt:   result.StartedAt,
+		CompletedAt: result.CompletedAt,
+	}, task.Repository)
+}
+
+type sanitizedPlannerAdapter struct {
+	agents.Adapter
+}
+
+func (a sanitizedPlannerAdapter) Start(ctx context.Context, request agents.Request) (agents.Run, error) {
+	run, err := a.Adapter.Start(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return sanitizedPlannerRun{Run: run}, nil
+}
+
+type sanitizedPlannerRun struct {
+	agents.Run
+}
+
+func (r sanitizedPlannerRun) Events() <-chan agents.Event {
+	in := r.Run.Events()
+	out := make(chan agents.Event)
+	go func() {
+		defer close(out)
+		for event := range in {
+			if event.Kind == agents.EventMessage {
+				event.Message, _ = parseMemoryUpdate(event.Message)
+			}
+			out <- event
+		}
+	}()
+	return out
+}
+
+func (r sanitizedPlannerRun) Wait() agents.Result {
+	result := r.Run.Wait()
+	result.Response, _ = parseMemoryUpdate(result.Response)
+	return result
 }
 
 func (s *Service) transition(ctx context.Context, id string, from, to model.TaskState, actor, summary string, data map[string]any) error {

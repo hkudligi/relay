@@ -121,8 +121,8 @@ is not installed or cannot report its version.
 
 ### Freebuff adapter
 
-The Freebuff CLI is a terminal UI with no headless mode: release 0.0.183 accepts
-no prompt argument and exposes no `--print` or `--output-format` flags. `rly`
+The Freebuff CLI is a terminal UI with no headless mode: current releases accept
+no prompt argument and expose no `--print` or `--output-format` flags. `rly`
 drives it over a pseudo-terminal and moves all machine-readable communication
 into temporary markdown files inside the workspace:
 

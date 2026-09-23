@@ -174,7 +174,7 @@ func TestCancelTerminatesRun(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "freebuff")
 	// A TUI that never writes result.md; cancellation must end the run.
-	script := "#!/bin/sh\nprintf '┌──┐\\n'; sleep 30\n"
+	script := "#!/bin/sh\nprintf '›\\n'; sleep 30\n"
 	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

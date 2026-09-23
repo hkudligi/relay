@@ -191,7 +191,7 @@ func TestExecuteWithPlanRunsPlannerThenExecutor(t *testing.T) {
 	if _, err := svc.ExecuteWithPlan(context.Background(), task, planner, executor, "", agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, func(e agents.Event) { planEmits = append(planEmits, e) }, func(e agents.Event) { execEmits = append(execEmits, e) }); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(executor.prompt, "Implementation plan from memory-fake") || !strings.Contains(executor.prompt, "1. inspect files") {
+	if !strings.Contains(executor.prompt, "Inter-agent context") || !strings.Contains(executor.prompt, "[plan via planner]") || !strings.Contains(executor.prompt, "1. inspect files") {
 		t.Fatalf("executor prompt = %q", executor.prompt)
 	}
 	if strings.Contains(executor.prompt, "fake.key") {

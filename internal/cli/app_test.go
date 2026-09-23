@@ -281,7 +281,7 @@ func TestRunPreservesCodexPlannerAndAgyExecutor(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath, "run", "--planner", "codex", "--agent", "agy", "implement", "it"}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(executor.request.Prompt, "Implementation plan from codex") || !strings.Contains(executor.request.Prompt, "streamed response") {
+	if !strings.Contains(executor.request.Prompt, "Inter-agent context") || !strings.Contains(executor.request.Prompt, "[plan via planner]") || !strings.Contains(executor.request.Prompt, "streamed response") {
 		t.Fatalf("executor prompt = %q", executor.request.Prompt)
 	}
 	if !strings.Contains(out.String(), "PLANNING → codex → agy") {
@@ -358,6 +358,22 @@ func TestREPLRetriesAnotherAgentAfterRuntimeQuotaExhaustion(t *testing.T) {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
 	if !strings.Contains(out.String(), "retrying after codex quota exhaustion: agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
+		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestREPLRetriesAnotherAgentAfterFreebuffFailure(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	app.Adapters = map[string]agents.Adapter{
+		"freebuff": &replAdapter{name: "freebuff", available: true, resultErr: errors.New("freebuff TUI did not produce result.md")},
+		"agy":      &replAdapter{name: "agy", available: true},
+	}
+	app.In = strings.NewReader("attempt the work\n/exit\n")
+
+	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "retrying after freebuff failure: agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
 		t.Fatalf("stdout = %q", out.String())
 	}
 }

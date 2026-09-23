@@ -101,7 +101,7 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		fs.SetOutput(a.Err)
 		jsonOut := fs.Bool("json", false, "emit JSON")
 		agentName := fs.String("agent", "auto", "agent adapter (codex, agy, cursor, freebuff, or auto)")
-		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, freebuff, or auto)")
+		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, or auto; freebuff is execution-only)")
 		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy (balanced, conservative, or quality-first)")
 		minReserve := fs.Float64("min-reserve", 15.0, "minimum token reserve percentage")
 		sandbox := fs.String("sandbox", string(agents.SandboxWorkspaceWrite), "sandbox mode (read-only or workspace-write)")
@@ -121,6 +121,10 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 			}
 		}
 		if *plannerName != "" && *plannerName != "auto" {
+			if *plannerName == "freebuff" {
+				fmt.Fprintln(a.Err, "freebuff is execution-only and cannot be used as a planner")
+				return ExitInvalid
+			}
 			if _, ok := a.Adapters[*plannerName]; !ok {
 				fmt.Fprintf(a.Err, "unknown planner adapter %q\n", *plannerName)
 				return ExitInvalid
@@ -295,6 +299,14 @@ func (a *App) executeObjectiveWithPlanner(ctx context.Context, svc *core.Service
 }
 
 func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service, repo, objective, plannerName, agentName string, policy core.RoutingPolicy, request agents.Request, jsonOut bool) int {
+	if plannerName == "freebuff" {
+		if jsonOut {
+			_ = a.json(runOutput{Error: "freebuff is execution-only and cannot be used as a planner"})
+		} else {
+			fmt.Fprintln(a.Err, "freebuff is execution-only and cannot be used as a planner")
+		}
+		return ExitInvalid
+	}
 	inventory := a.discoverInventory(ctx)
 	if !jsonOut {
 		a.printInventory(inventory)
@@ -307,7 +319,8 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 	var planner agents.Adapter
 	plannerModel := ""
 	if plannerName == "auto" {
-		planDecision, err := svc.Route(ctx, t.ID, core.RolePlanning, objective, a.Adapters, inventory, policy)
+		planningAdapters, planningInventory := planningCandidates(a.Adapters, inventory)
+		planDecision, err := svc.Route(ctx, t.ID, core.RolePlanning, objective, planningAdapters, planningInventory, policy)
 		if err != nil {
 			if jsonOut {
 				_ = a.json(runOutput{Inventory: inventory, Task: t, Error: err.Error()})
@@ -398,12 +411,12 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 	// A provider with UNKNOWN quota can still reject a planning request at
 	// runtime. ExecuteWithPlan returns before the executor in that case, so
 	// retry planning once with the next eligible provider.
-	if runErr != nil && planner != nil && core.IsQuotaExhausted(runErr) && plannerName == "auto" && len(a.Adapters) > 1 {
+	if runErr != nil && planner != nil && shouldRetryAgent(planner, runErr) && plannerName == "auto" && len(a.Adapters) > 1 {
 		fallbackInventory := filterFailedModel(inventory, planner.Name(), plannerModel)
-		fallbackAdapters := adaptersForInventory(a.Adapters, fallbackInventory)
+		fallbackAdapters, fallbackInventory := planningCandidates(adaptersForInventory(a.Adapters, fallbackInventory), fallbackInventory)
 		if fallbackDecision, routeErr := svc.Route(ctx, t.ID, core.RolePlanning, objective, fallbackAdapters, fallbackInventory, policy); routeErr == nil {
 			if !jsonOut {
-				fmt.Fprintf(a.Out, "retrying after %s quota exhaustion: %s model=%s\n", planner.Name(), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
+				fmt.Fprintf(a.Out, "retrying after %s %s: %s model=%s\n", planner.Name(), retryReason(planner, runErr), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
 			}
 			planner = fallbackAdapters[fallbackDecision.SelectedAgent]
 			plannerModel = fallbackDecision.SelectedModel
@@ -413,7 +426,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 	// UNKNOWN quota providers can still reject a request at runtime. Remove
 	// that adapter from the candidate set and make one transparent retry so a
 	// healthy provider (for example Codex Luna) gets a chance to run the task.
-	if runErr != nil && core.IsQuotaExhausted(runErr) && (agentName == "auto" || agentName == "") && len(a.Adapters) > 1 {
+	if runErr != nil && shouldRetryAgent(adapter, runErr) && (agentName == "auto" || agentName == "") && len(a.Adapters) > 1 {
 		// A provider can expose multiple models with separate limits. Remove
 		// only the model that rejected the request, instead of discarding the
 		// entire adapter (for example, Codex Luna may fail while another model
@@ -444,7 +457,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		fallbackPolicy.UnknownQuota = "allow"
 		if fallbackDecision, routeErr := svc.Route(ctx, t.ID, core.RoleImplementation, objective, fallbackAdapters, fallbackInventory, fallbackPolicy); routeErr == nil {
 			if !jsonOut {
-				fmt.Fprintf(a.Out, "retrying after %s quota exhaustion: %s model=%s\n", adapter.Name(), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
+				fmt.Fprintf(a.Out, "retrying after %s %s: %s model=%s\n", adapter.Name(), retryReason(adapter, runErr), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
 			}
 			adapter = fallbackAdapters[fallbackDecision.SelectedAgent]
 			primaryDecision = fallbackDecision
@@ -532,11 +545,36 @@ func (a *App) printInventory(inventory []agents.ModelAvailability) {
 	}
 }
 
+func retryReason(adapter agents.Adapter, err error) string {
+	if core.IsQuotaExhausted(err) {
+		return "quota exhaustion"
+	}
+	if adapter.Name() == "freebuff" {
+		return "failure"
+	}
+	return "failure"
+}
+
+func shouldRetryAgent(adapter agents.Adapter, err error) bool {
+	if err == nil {
+		return false
+	}
+	// Freebuff is a PTY/file-channel adapter. A readiness, idle-timeout, or
+	// result-file failure is operational rather than a user task failure, so
+	// auto routing should give another installed adapter a chance.
+	return core.IsQuotaExhausted(err) || adapter.Name() == "freebuff"
+}
+
 func filterFailedModel(inventory []agents.ModelAvailability, agent, model string) []agents.ModelAvailability {
 	filtered := make([]agents.ModelAvailability, 0, len(inventory))
 	for _, item := range inventory {
 		if item.Agent != agent {
 			filtered = append(filtered, item)
+			continue
+		}
+		// Freebuff's model picker is inside the TUI, so a failed PTY run
+		// invalidates the whole adapter for this retry, not just one catalog row.
+		if agent == "freebuff" {
 			continue
 		}
 		// A provider with an unknown/default model cannot be safely retried:
@@ -577,6 +615,22 @@ func adaptersForInventory(adapters map[string]agents.Adapter, inventory []agents
 		}
 	}
 	return filtered
+}
+
+func planningCandidates(adapters map[string]agents.Adapter, inventory []agents.ModelAvailability) (map[string]agents.Adapter, []agents.ModelAvailability) {
+	filteredAdapters := make(map[string]agents.Adapter, len(adapters))
+	for name, adapter := range adapters {
+		if name != "freebuff" && adapter.Name() != "freebuff" {
+			filteredAdapters[name] = adapter
+		}
+	}
+	filteredInventory := make([]agents.ModelAvailability, 0, len(inventory))
+	for _, item := range inventory {
+		if item.Agent != "freebuff" {
+			filteredInventory = append(filteredInventory, item)
+		}
+	}
+	return filteredAdapters, filteredInventory
 }
 
 func yesNo(value bool) string {
@@ -665,7 +719,7 @@ func (a *App) help() {
 
 Usage:
   rly [--state PATH]
-  rly [--state PATH] run [--planner codex|agy|cursor|freebuff|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--sandbox MODE] [--json] <objective>
+  rly [--state PATH] run [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--sandbox MODE] [--json] <objective>
   rly [--state PATH] agents [--json]
   rly [--state PATH] status [--json]
   rly [--state PATH] tasks [--json]
