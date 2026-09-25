@@ -86,6 +86,7 @@ type CandidateScore struct {
 	Eligible         bool           `json:"eligible"`
 	Exclusion        string         `json:"exclusion,omitempty"`
 	TotalScore       float64        `json:"total_score"`
+	AgentWeight      float64        `json:"agent_weight"`
 	CapabilityFit    float64        `json:"capability_fit"`
 	QuotaHeadroom    float64        `json:"quota_headroom"`
 	SessionValue     float64        `json:"session_value"`

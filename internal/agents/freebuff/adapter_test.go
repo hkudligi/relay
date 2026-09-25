@@ -126,6 +126,61 @@ func TestStartStreamsStatusProgress(t *testing.T) {
 	}
 }
 
+func TestPruneStaleRunDirectoriesRemovesOnlyOldRunDirs(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, ".rly", "freebuff")
+	stale := filepath.Join(root, "run-stale")
+	fresh := filepath.Join(root, "run-fresh")
+	other := filepath.Join(root, "not-a-run")
+	for _, dir := range []string{stale, fresh, other} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stale, "result.md"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fresh, "prompt.md"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "keep.md"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldOther := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(other, oldOther, oldOther); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	pruned, err := freebuff.PruneStaleRunDirectories(workspace, cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale run dir still present: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh run dir must survive: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("non run-* directories must never be pruned: %v", err)
+	}
+}
+
+func TestPruneStaleRunDirectoriesHandlesMissingRoot(t *testing.T) {
+	pruned, err := freebuff.PruneStaleRunDirectories(filepath.Join(t.TempDir(), "missing"), time.Now())
+	if err != nil || pruned != 0 {
+		t.Fatalf("pruned = %d, err = %v, want 0, nil", pruned, err)
+	}
+}
+
 func TestDetectReportsMissingBinary(t *testing.T) {
 	installation := freebuff.New(filepath.Join(t.TempDir(), "nope")).Detect(context.Background())
 	if installation.Available {
@@ -190,5 +245,35 @@ func TestCancelTerminatesRun(t *testing.T) {
 	result := run.Wait()
 	if result.Err == nil {
 		t.Fatal("expected cancellation error, got success")
+	}
+}
+
+func TestSessionEndedScreenStopsRunForFallback(t *testing.T) {
+	workspace := t.TempDir()
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "freebuff")
+	script := `#!/bin/sh
+printf '› _\n'
+while IFS= read -r line; do
+  case "$line" in
+    *prompt.md*) break ;;
+  esac
+done
+printf 'Session ended\nPress Enter to continue in a new session\n'
+sleep 30
+`
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	run, err := freebuff.New("").Start(context.Background(), agents.Request{Prompt: "session ends", Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range run.Events() {
+	}
+	result := run.Wait()
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "session ended") {
+		t.Fatalf("result = %+v, want session-ended failure", result)
 	}
 }

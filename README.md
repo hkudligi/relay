@@ -30,6 +30,8 @@ Useful commands:
 ./rly agents --json
 ./rly status
 ./rly tasks
+./rly ops
+./rly cancel <task-id>
 ./rly memory
 ./rly memory set test.command "go test ./..."
 ./rly memory delete test.command
@@ -39,6 +41,9 @@ Useful commands:
 
 State is stored in `~/.rly/state.db` by default. Use `--state PATH` before the
 subcommand to select another database.
+
+Human-readable `rly run` commands execute supported agents headlessly and stream
+their progress through `rly`; runs do not open additional Terminal tabs.
 
 ## Conversational REPL
 
@@ -132,6 +137,11 @@ into temporary markdown files inside the workspace:
 .rly/freebuff/run-<id>/result.md   final response written by the agent
 ```
 
+Workspace `.rly/` artifacts are best-effort scratch state and are pruned after
+7 days. The repository's `.gitignore` already excludes `/.rly`; downstream users
+of installed binaries should add the same ignore rule to avoid committing local
+run channels.
+
 `rly` writes the full task brief (objective, project memory, memory-update
 contract, and the reporting protocol) to `prompt.md`, pastes a one-line pointer
 at that file into the TUI, tails `status.md` as the streamed progress channel,
@@ -148,6 +158,12 @@ inspects the repository in read-only mode and produces an implementation plan;
 that plan is then included in the prompt sent to `agy`, which performs the
 workspace changes. Both runs are persisted under the same task and appear in
 `rly trace <task-id>`.
+
+Operational hardening commands:
+
+- `rly run --max-total-tokens N ...` records a task-level token cap and stops before launch when estimated usage would exceed it.
+- `rly ops` lists blocked, failed, waiting, and aging non-terminal tasks; use `--aging 2h` or `--json` for automation.
+- `rly cancel --reason TEXT --idempotency-key KEY <task-id>` cancels active work through an actor-checked, idempotent path and records the cancellation in the task artifact.
 
 ### Multi-process orchestration
 

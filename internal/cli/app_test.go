@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/harsha/relay/internal/agents"
 	"github.com/harsha/relay/internal/agents/codex"
@@ -24,6 +26,7 @@ type replAdapter struct {
 	request   agents.Request
 	resultErr error
 	startErr  error
+	progress  bool
 }
 
 func (a *replAdapter) Name() string {
@@ -51,8 +54,11 @@ func (a *replAdapter) Start(_ context.Context, request agents.Request) (agents.R
 	if a.startErr != nil {
 		return nil, a.startErr
 	}
-	events := make(chan agents.Event, 3)
+	events := make(chan agents.Event, 4)
 	events <- agents.Event{Kind: agents.EventSession, SessionID: "repl-session"}
+	if a.progress {
+		events <- agents.Event{Kind: agents.EventProgress, Type: "tool_call", Data: map[string]any{"state": "running"}}
+	}
 	events <- agents.Event{Kind: agents.EventMessage, Message: "streamed response"}
 	if a.resultErr != nil {
 		events <- agents.Event{Kind: agents.EventError, Message: a.resultErr.Error()}
@@ -133,6 +139,53 @@ func TestEmptyStatus(t *testing.T) {
 	}
 }
 
+func TestOpsShowsAgingTasks(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aged := model.Task{ID: "task-aged", Repository: filepath.Dir(dbPath), Objective: "old work", State: model.TaskPlanning, Version: 1, CreatedAt: time.Now().UTC().Add(-2 * time.Hour), UpdatedAt: time.Now().UTC().Add(-2 * time.Hour)}
+	if err := db.CreateTask(context.Background(), aged, model.Event{ID: "evt-aged", TaskID: aged.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: aged.Objective, CreatedAt: aged.CreatedAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "ops", "--aging", "1h"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Needs attention") || !strings.Contains(out.String(), "task-aged") || !strings.Contains(out.String(), "aging") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestCancelCommandIsIdempotent(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := core.New(db)
+	task, err := svc.StartTask(context.Background(), filepath.Dir(dbPath), "cancel from cli")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "cancel", "--reason", "superseded", "--idempotency-key", "cli-cancel-1", task.ID}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), string(model.TaskCancelled)) {
+		t.Fatalf("output = %q", out.String())
+	}
+	out.Reset()
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "cancel", "--reason", "superseded", "--idempotency-key", "cli-cancel-1", task.ID}); code != cli.ExitOK {
+		t.Fatalf("second exit = %d, stderr = %s", code, errOut.String())
+	}
+}
+
 func TestMemoryCommands(t *testing.T) {
 	app, out, errOut, db := testApp(t)
 	if code := app.Run(context.Background(), []string{"--state", db, "memory", "set", "build.command", "go", "test", "./..."}); code != cli.ExitOK {
@@ -168,7 +221,7 @@ func TestREPLExecutesObjectiveWithDefaultCodexAdapter(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if got := out.String(); !strings.Contains(got, "test-model") || !strings.Contains(got, "remaining=75%") || !strings.Contains(got, "PLANNING → codex") || !strings.Contains(got, "streamed response") || !strings.Contains(got, "✓ COMPLETED (repl-session)") {
+	if got := out.String(); !strings.Contains(got, "Model availability") || !strings.Contains(got, "test-model") || !strings.Contains(got, "75%") || !strings.Contains(got, "PLANNING → implementer codex") || !strings.Contains(got, "streamed response") || !strings.Contains(got, "✓ COMPLETED (repl-session)") {
 		t.Fatalf("output = %q", got)
 	}
 	if adapter.request.Workspace == "" || adapter.request.Sandbox != agents.SandboxWorkspaceWrite || !strings.HasPrefix(adapter.request.Prompt, "implement the feature") {
@@ -208,7 +261,7 @@ func TestREPLExecutesObjectiveWithDefaultCodexAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 7 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "routing.selected" || events[4].Summary != "implementer → codex" || events[6].Type != "task.state_changed" {
+	if len(events) != 8 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "routing.selected" || events[4].Summary != "implementer → codex" || events[5].Type != "orchestration.selected" || events[7].Type != "task.state_changed" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -273,6 +326,29 @@ func TestAgentsJSONKeepsUnavailableQuotaUnknown(t *testing.T) {
 	}
 }
 
+func TestHelpDocumentsRoutingStrategyAndReserveOptions(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "help"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"--strategy balanced",
+		"--strategy conservative",
+		"--strategy quality-first",
+		"--min-reserve PCT",
+		"auto-routing skips agents below",
+		"unless no higher-headroom agent is",
+		"--max-total-tokens N",
+		"rly [--state PATH] ops",
+		"rly [--state PATH] cancel",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("help missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRunPreservesCodexPlannerAndAgyExecutor(t *testing.T) {
 	app, out, errOut, dbPath := testApp(t)
 	planner := &replAdapter{name: "codex", available: true}
@@ -284,7 +360,19 @@ func TestRunPreservesCodexPlannerAndAgyExecutor(t *testing.T) {
 	if !strings.Contains(executor.request.Prompt, "Inter-agent context") || !strings.Contains(executor.request.Prompt, "[plan via planner]") || !strings.Contains(executor.request.Prompt, "streamed response") {
 		t.Fatalf("executor prompt = %q", executor.request.Prompt)
 	}
-	if !strings.Contains(out.String(), "PLANNING → codex → agy") {
+	if !strings.Contains(out.String(), "router: planner codex model=test-model") || !strings.Contains(out.String(), "router: implementer agy model=test-model") || !strings.Contains(out.String(), "PLANNING → planner codex (test-model) → implementer agy (test-model)") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestRunPrintsNormalizedProgressUpdates(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	adapter := &replAdapter{name: "codex", available: true, progress: true}
+	app.Adapters = map[string]agents.Adapter{"codex": adapter}
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "run", "inspect", "it"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "[executor codex model=test-model] progress: tool_call state=running") {
 		t.Fatalf("output = %q", out.String())
 	}
 }
@@ -348,7 +436,118 @@ func TestREPLPersistsAgentFailureAndContinues(t *testing.T) {
 	}
 }
 
-func TestREPLRetriesAnotherAgentAfterRuntimeQuotaExhaustion(t *testing.T) {
+func TestCleanupRunsAutomaticallyOnEveryInvocation(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// Seed one task older than the 7-day retention window and one recent.
+	aged := model.Task{ID: "task-aged", Repository: t.TempDir(), Objective: "aged", State: model.TaskPlanning, Version: 1, CreatedAt: time.Now().UTC().Add(-8 * 24 * time.Hour), UpdatedAt: time.Now().UTC().Add(-8 * 24 * time.Hour)}
+	agedEvent := model.Event{ID: "evt-aged", TaskID: aged.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: aged.Objective, CreatedAt: aged.CreatedAt}
+	if err := db.CreateTask(ctx, aged, agedEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordRun(ctx, model.RunRecord{ID: "run-aged", TaskID: aged.ID, Adapter: "codex", Status: "COMPLETED", StartedAt: aged.CreatedAt, CompletedAt: aged.UpdatedAt}, aged.Repository); err != nil {
+		t.Fatal(err)
+	}
+	recentTask := model.Task{ID: "task-recent", Repository: aged.Repository, Objective: "recent", State: model.TaskPlanning, Version: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	recentEvent := model.Event{ID: "evt-recent", TaskID: recentTask.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: recentTask.Objective, CreatedAt: recentTask.CreatedAt}
+	if err := db.CreateTask(ctx, recentTask, recentEvent); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app.Getwd = func() (string, error) { return aged.Repository, nil }
+	if code := app.Run(ctx, []string{"--state", dbPath, "status", "--json"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	// Cleanup runs before the command and reports what it pruned on stderr so
+	// stdout remains machine-readable for --json consumers.
+	if !strings.Contains(errOut.String(), "cleanup: pruned 1 task(s) older than 7 days") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	var status model.Status
+	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Task == nil || status.Task.ID != recentTask.ID {
+		t.Fatalf("status = %+v", status)
+	}
+	if strings.Contains(out.String(), "task-aged") {
+		t.Fatalf("aged task survived automatic cleanup: %q", out.String())
+	}
+	if strings.Contains(out.String(), "cleanup:") {
+		t.Fatalf("cleanup chatter leaked to stdout: %q", out.String())
+	}
+}
+
+func TestCleanupPrunesStaleFreebuffRunDirectories(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	workspace := t.TempDir()
+	app.Getwd = func() (string, error) { return workspace, nil }
+	root := filepath.Join(workspace, ".rly", "freebuff")
+	stale := filepath.Join(root, "run-stale")
+	fresh := filepath.Join(root, "run-fresh")
+	for _, dir := range []string{stale, fresh} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fresh, "prompt.md"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "status"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "cleanup: removed 1 freebuff run director(y|ies) older than 7 days") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale channel still on disk: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fresh, "prompt.md")); err != nil {
+		t.Fatalf("fresh channel must survive cleanup: %v", err)
+	}
+	if strings.Contains(errOut.String(), "cleanup freebuff channels") {
+		t.Fatalf("unexpected channel cleanup error: %q", errOut.String())
+	}
+	_ = out
+}
+
+func TestCleanupFailureDoesNotBlockCommand(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	// A workspace whose .rly/freebuff path is occupied by a regular file makes
+	// channel cleanup fail; the status command must still succeed.
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, ".rly"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".rly", "freebuff"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app.Getwd = func() (string, error) { return workspace, nil }
+
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "status"}); code != cli.ExitOK {
+		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "rly: cleanup freebuff channels:") {
+		t.Fatalf("stderr = %q", errOut.String())
+	}
+	if !strings.Contains(out.String(), "task: none") {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
+func TestREPLPrefersAgyOverCodex(t *testing.T) {
 	app, out, errOut, dbPath := testApp(t)
 	app.Adapters["codex"] = &replAdapter{available: true, resultErr: errors.New("RESOURCE_EXHAUSTED: individual quota reached")}
 	app.Adapters["agy"] = &replAdapter{name: "agy", available: true}
@@ -357,12 +556,12 @@ func TestREPLRetriesAnotherAgentAfterRuntimeQuotaExhaustion(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "retrying after codex quota exhaustion: agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
+	if !strings.Contains(out.String(), "executor=agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
 		t.Fatalf("stdout = %q", out.String())
 	}
 }
 
-func TestREPLRetriesAnotherAgentAfterFreebuffFailure(t *testing.T) {
+func TestREPLPrefersAgyOverFreebuff(t *testing.T) {
 	app, out, errOut, dbPath := testApp(t)
 	app.Adapters = map[string]agents.Adapter{
 		"freebuff": &replAdapter{name: "freebuff", available: true, resultErr: errors.New("freebuff TUI did not produce result.md")},
@@ -373,7 +572,7 @@ func TestREPLRetriesAnotherAgentAfterFreebuffFailure(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "retrying after freebuff failure: agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
+	if !strings.Contains(out.String(), "executor=agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
 		t.Fatalf("stdout = %q", out.String())
 	}
 }
@@ -419,7 +618,7 @@ func TestRunAutoRoutesToBestAgentBasedOnTokensAndEfficacy(t *testing.T) {
 	if code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "router:") || !strings.Contains(out.String(), "PLANNING →") {
+	if !strings.Contains(out.String(), "router: implementer") || !strings.Contains(out.String(), "PLANNING → implementer") {
 		t.Fatalf("output = %q", out.String())
 	}
 }

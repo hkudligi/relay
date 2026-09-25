@@ -167,9 +167,10 @@ func (r *run) loop(ctx context.Context) {
 
 	var offset int64
 	started := time.Now()
+	r.ch.trace("run.loop.started handoff_required=%t file_state=%s", r.handoffRequired, r.ch.fileState())
 	lastActivity := started
+	lastHeartbeat := started
 	var pendingFileResult string
-	var pendingNativeResult string
 	submitted := false
 	acceptedLogged := false
 	ticker := time.NewTicker(400 * time.Millisecond)
@@ -182,7 +183,7 @@ func (r *run) loop(ctx context.Context) {
 			r.finish(agents.Result{ExitCode: -1, Err: ctx.Err(), Error: ctx.Err().Error()})
 			return
 		case err := <-r.session.waitExit:
-			r.ch.trace("tui.exited error=%q", err)
+			r.ch.trace("tui.exited error=%q exit_code=%d file_state=%s diagnostic=%q", err, r.session.exitCode(), r.ch.fileState(), clipDiagnostic(r.session.diagnostic()))
 			// Flush status lines written before exit, then settle the outcome:
 			// result.md wins if the agent wrote it just before exiting; only a
 			// missing result.md means the run died mid-task.
@@ -216,15 +217,25 @@ func (r *run) loop(ctx context.Context) {
 			r.finish(result)
 			return
 		case err := <-r.session.fatal:
-			r.ch.trace("tui.fatal error=%q", err)
+			// A session-ended screen can race with the agent's final result write;
+			// let result.md win if it is already complete.
+			if response, readErr := r.ch.readResult(); readErr == nil && strings.TrimSpace(response) != "" {
+				response = strings.TrimSpace(response)
+				r.ch.trace("result.detected source=result.md after_fatal=true bytes=%d", len(response))
+				r.events <- agents.Event{Kind: agents.EventResult, Type: "result.md", Message: response}
+				r.finish(agents.Result{ExitCode: 0, Response: response})
+				return
+			}
+			r.ch.trace("tui.fatal error=%q file_state=%s diagnostic=%q", err, r.ch.fileState(), clipDiagnostic(r.session.diagnostic()))
 			r.finish(agents.Result{ExitCode: -1, Err: err, Error: err.Error()})
 			return
 		case <-r.session.activity:
 			lastActivity = time.Now()
 		case <-ticker.C:
+			now := time.Now()
 			if !r.session.sessionAlive() {
-				err := fmt.Errorf("freebuff TUI session disappeared; pane=%q", r.session.paneSnapshot())
-				r.ch.trace("tui.session.disappeared error=%q", err)
+				err := fmt.Errorf("freebuff TUI session disappeared; pane=%q", clipDiagnostic(r.session.paneSnapshot()))
+				r.ch.trace("tui.session.disappeared error=%q file_state=%s diagnostic=%q", err, r.ch.fileState(), clipDiagnostic(r.session.diagnostic()))
 				r.finish(agents.Result{ExitCode: -1, Err: err, Error: err.Error()})
 				return
 			}
@@ -232,32 +243,39 @@ func (r *run) loop(ctx context.Context) {
 				lastActivity = time.Now()
 			}
 			if r.handoffRequired && !acceptedLogged && r.ch.accepted() {
-				r.ch.trace("handoff.accepted path=%q", r.ch.AcceptedPath())
+				r.ch.trace("handoff.accepted path=%q file_state=%s", r.ch.AcceptedPath(), r.ch.fileState())
 				acceptedLogged = true
 			}
-			if !submitted && (!r.handoffRequired || r.ch.accepted()) && r.ch.nativePromptSubmitted(started) {
-				r.ch.trace("native.prompt.acknowledged")
-				submitted = true
+			if !submitted && (!r.handoffRequired || r.ch.accepted()) {
+				if recorded, detail := r.ch.nativePromptStatus(started); recorded {
+					r.ch.trace("native.prompt.recorded detail=%q", detail)
+					submitted = true
+				}
+			}
+			if now.Sub(lastHeartbeat) >= 15*time.Second {
+				nativeRecorded, nativeDetail := r.ch.nativePromptStatus(started)
+				r.ch.trace("run.heartbeat elapsed=%s submitted=%t native_recorded=%t native_detail=%q accepted=%t file_state=%s tui_alive=%t tui_inactive=%s diagnostic=%q", now.Sub(started).Round(time.Second), submitted, nativeRecorded, nativeDetail, r.ch.accepted(), r.ch.fileState(), r.session.sessionAlive(), r.session.inactiveFor().Round(time.Second), clipDiagnostic(r.session.paneSnapshot()))
+				lastHeartbeat = now
 			}
 			if r.handoffRequired && !r.ch.accepted() && time.Since(started) >= freebuffSubmissionTimeout {
 				err := errFreebuffAcceptanceTimeout
-				r.ch.trace("run.timeout kind=handoff_acceptance error=%q", err)
+				r.ch.trace("run.timeout kind=handoff_acceptance error=%q file_state=%s diagnostic=%q", err, r.ch.fileState(), clipDiagnostic(r.session.paneSnapshot()))
 				r.finish(agents.Result{ExitCode: -1, Err: err, Error: err.Error()})
 				return
 			}
 			if !r.handoffRequired && !submitted && time.Since(started) >= freebuffSubmissionTimeout {
 				err := errFreebuffSubmissionTimeout
-				r.ch.trace("run.timeout kind=prompt_submission error=%q", err)
+				r.ch.trace("run.timeout kind=prompt_submission error=%q file_state=%s diagnostic=%q", err, r.ch.fileState(), clipDiagnostic(r.session.paneSnapshot()))
 				r.finish(agents.Result{ExitCode: -1, Err: err, Error: err.Error()})
 				return
 			}
 			if time.Since(lastActivity) >= freebuffIdleTimeout {
-				r.ch.trace("run.timeout kind=idle")
+				r.ch.trace("run.timeout kind=idle file_state=%s diagnostic=%q", r.ch.fileState(), clipDiagnostic(r.session.paneSnapshot()))
 				r.finish(agents.Result{ExitCode: -1, Err: errFreebuffIdleTimeout, Error: errFreebuffIdleTimeout.Error()})
 				return
 			}
 			if time.Since(started) >= freebuffMaxRuntime {
-				r.ch.trace("run.timeout kind=max_runtime")
+				r.ch.trace("run.timeout kind=max_runtime file_state=%s diagnostic=%q", r.ch.fileState(), clipDiagnostic(r.session.paneSnapshot()))
 				r.finish(agents.Result{ExitCode: -1, Err: errFreebuffMaxRuntime, Error: errFreebuffMaxRuntime.Error()})
 				return
 			}
@@ -277,21 +295,6 @@ func (r *run) loop(ctx context.Context) {
 				}
 			} else {
 				pendingFileResult = ""
-			}
-			// Planner-backed runs must complete through result.md. Native chat
-			// text is useful as a submission acknowledgement, but it can be an
-			// interrupted/partial model response and must not create a false
-			// successful orchestration result.
-			if !r.handoffRequired {
-				if response := r.ch.nativeResponse(started); response != "" {
-					if pendingNativeResult == response {
-						r.ch.trace("result.detected source=chat-messages.json bytes=%d", len(response))
-						r.events <- agents.Event{Kind: agents.EventResult, Type: "chat-messages.json", Message: response}
-						r.finish(agents.Result{ExitCode: 0, Response: response})
-						return
-					}
-					pendingNativeResult = response
-				}
 			}
 		}
 	}
@@ -322,9 +325,9 @@ var (
 func (r *run) finish(result agents.Result) {
 	r.finishOnce.Do(func() {
 		if result.Err != nil {
-			r.ch.trace("run.finished outcome=error error=%q", result.Err)
+			r.ch.trace("run.finished outcome=error error=%q file_state=%s", result.Err, r.ch.fileState())
 		} else {
-			r.ch.trace("run.finished outcome=success response_bytes=%d", len(result.Response))
+			r.ch.trace("run.finished outcome=success response_bytes=%d file_state=%s", len(result.Response), r.ch.fileState())
 		}
 		// Every terminal outcome owns the child process. This is especially
 		// important when result.md wins before the interactive TUI exits.
@@ -338,4 +341,12 @@ func (r *run) finish(result agents.Result) {
 		r.done <- result
 		r.cancel()
 	})
+}
+
+func clipDiagnostic(value string) string {
+	value = strings.TrimSpace(stripANSI(value))
+	if len(value) > 1200 {
+		return value[len(value)-1200:]
+	}
+	return value
 }

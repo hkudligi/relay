@@ -14,6 +14,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const maxOpenConns = 4
+
 var ErrNotFound = errors.New("not found")
 
 type SQLite struct{ db *sql.DB }
@@ -26,10 +28,13 @@ func Open(path string) (*SQLite, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open state: %w", err)
 	}
-	// SQLite connection-local pragmas and write serialization are predictable
-	// when the MVP uses one connection. Revisit this when the daemon introduces
-	// concurrent readers and a dedicated writer.
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(maxOpenConns)
+	if _, err := db.ExecContext(context.Background(), "PRAGMA busy_timeout = 5000"); err != nil {
+		return nil, fmt.Errorf("set busy_timeout pragma: %w", err)
+	}
+	if _, err := db.ExecContext(context.Background(), "PRAGMA synchronous = NORMAL"); err != nil {
+		return nil, fmt.Errorf("set synchronous pragma: %w", err)
+	}
 	s := &SQLite{db: db}
 	if err := s.migrate(context.Background()); err != nil {
 		db.Close()
@@ -58,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tasks_repo_updated ON tasks(repository, updated_at DESC);
+CREATE INDEX IF NOT EXISTS tasks_updated ON tasks(updated_at);
 CREATE TABLE IF NOT EXISTS events (
   id TEXT PRIMARY KEY,
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -241,8 +247,15 @@ func scanTask(row scanner) (*model.Task, error) {
 	} else if err != nil {
 		return nil, err
 	}
-	t.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
-	t.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	var err error
+	t.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return nil, fmt.Errorf("parse task created_at: %w", err)
+	}
+	t.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+	if err != nil {
+		return nil, fmt.Errorf("parse task updated_at: %w", err)
+	}
 	return &t, nil
 }
 
@@ -277,7 +290,10 @@ func (s *SQLite) Events(ctx context.Context, taskID string) ([]model.Event, erro
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(raw), &e.Data)
-		e.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		e.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+		if err != nil {
+			return nil, fmt.Errorf("parse event created_at: %w", err)
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -296,10 +312,47 @@ func (s *SQLite) ProjectMemory(ctx context.Context, repository string) ([]model.
 		if err := rows.Scan(&item.Repository, &item.Key, &item.Value, &item.SourceTaskID, &updated); err != nil {
 			return nil, err
 		}
-		item.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		item.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+		if err != nil {
+			return nil, fmt.Errorf("parse project memory updated_at: %w", err)
+		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// PruneOldRuns deletes tasks whose last update happened before cutoff,
+// together with their events, runs, and sessions, in one transaction. The
+// deletion is task-granular: a run is kept for as long as its task survives,
+// so history for a recently updated task is never partially removed.
+// Durable project memory and repository records are never pruned.
+func (s *SQLite) PruneOldRuns(ctx context.Context, cutoff time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	cutoffStamp := stamp(cutoff)
+	// Children are removed before their tasks so the foreign keys enforced by
+	// the PRAGMA above are never violated.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE task_id IN (SELECT id FROM tasks WHERE updated_at < ?)`, cutoffStamp); err != nil {
+		return 0, fmt.Errorf("prune runs: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE task_id IN (SELECT id FROM tasks WHERE updated_at < ?)`, cutoffStamp); err != nil {
+		return 0, fmt.Errorf("prune sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE task_id IN (SELECT id FROM tasks WHERE updated_at < ?)`, cutoffStamp); err != nil {
+		return 0, fmt.Errorf("prune events: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE updated_at < ?`, cutoffStamp)
+	if err != nil {
+		return 0, fmt.Errorf("prune tasks: %w", err)
+	}
+	pruned, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return pruned, nil
 }
 
 // ApplyMemory applies a complete memory update atomically. Upserts replace

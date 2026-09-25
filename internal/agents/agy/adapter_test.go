@@ -47,3 +47,26 @@ func TestResumeRequiresSession(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestStartUsesExplicitAcceptEditsMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agy")
+	script := `#!/bin/sh
+case " $* " in
+  *" --mode accept-edits "*) ;;
+  *) exit 9 ;;
+esac
+printf '%s\n' '{"event":"result","result":{"conversation_id":"conv-write","status":"SUCCESS","response":"edited"}}'
+`
+	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	run, err := agy.New(path).Start(context.Background(), agents.Request{Prompt: "edit", Workspace: t.TempDir(), Sandbox: agents.SandboxWorkspaceWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range run.Events() {
+	}
+	if result := run.Wait(); result.Err != nil {
+		t.Fatalf("write-mode run failed: %v", result.Err)
+	}
+}

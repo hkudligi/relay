@@ -3,7 +3,6 @@ package agy
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"os/exec"
 	"sort"
 	"strings"
@@ -36,12 +35,19 @@ func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability
 			ID string `json:"id"`
 		} `json:"models"`
 	}
+	seen := map[string]bool{}
 	var names []string
+	addName := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
 	if err := json.Unmarshal(output, &payload); err == nil && len(payload.Models) > 0 {
 		for _, item := range payload.Models {
-			if strings.TrimSpace(item.ID) != "" {
-				names = append(names, item.ID)
-			}
+			addName(item.ID)
 		}
 	} else {
 		// Fallback: agy may output a plain list (e.g., "model-id   description")
@@ -65,14 +71,10 @@ func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability
 				return r < 32 || r > 126
 			})
 			fields := strings.Fields(cleanLine)
-			for _, f := range fields {
-				if strings.Contains(f, "-") {
-					names = append(names, f)
-				}
+			if len(fields) == 0 {
+				continue
 			}
-			// Debug: log the processed line and any names found
-			log.Printf("agy fallback line=%q fields=%v names=%v", line, fields, names)
-
+			addName(strings.Trim(fields[0], ",:;"))
 		}
 	}
 	if len(names) == 0 {

@@ -42,6 +42,7 @@ type tuiSession struct {
 var (
 	errSessionDead   = errors.New("freebuff TUI exited before accepting the task")
 	errReadinessGone = errors.New("freebuff TUI exited before becoming ready")
+	errSessionEnded  = errors.New("freebuff session ended before writing result.md")
 )
 
 // startTUI launches the CLI inside a PTY without seeding a prompt: the
@@ -183,6 +184,15 @@ func (s *tuiSession) sessionAlive() bool {
 	return exec.Command(s.tmux, "has-session", "-t", s.tmuxSession).Run() == nil
 }
 
+func (s *tuiSession) exitCode() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cmd == nil || s.cmd.ProcessState == nil {
+		return -1
+	}
+	return s.cmd.ProcessState.ExitCode()
+}
+
 func (s *tuiSession) paneSnapshot() string {
 	if s.tmux == "" {
 		return s.diagnostic()
@@ -221,6 +231,13 @@ func (s *tuiSession) watch() {
 				s.signalFatal(fmt.Errorf("freebuff failed during startup: %s", s.diagnostic()))
 				return
 			}
+			// Freebuff can leave the outer TUI process alive after its model
+			// session ends. Treat the end-session screen as terminal so the run
+			// loop does not wait for the idle timeout with an orphaned TUI.
+			if sessionEndedScreen(output.String()) {
+				s.signalFatal(errSessionEnded)
+				return
+			}
 			dialogSeen := strings.Contains(output.String(), "Take over")
 			if dialogSeen && !dialogDismissed {
 				// The dialog focuses "Take over" first. Select it so an
@@ -255,6 +272,11 @@ func (s *tuiSession) watch() {
 			return
 		}
 	}
+}
+
+func sessionEndedScreen(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "session ended") && strings.Contains(output, "press enter to continue in a new session")
 }
 
 // pasteWaitReady blocks until the TUI accepts input, then writes one line

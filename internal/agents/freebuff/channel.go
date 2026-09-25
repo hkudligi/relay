@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -56,6 +55,48 @@ func newChannel(workspace string) (*channel, error) {
 		return nil, err
 	}
 	return &channel{Workspace: workspace, Dir: dir}, nil
+}
+
+// MaxChannelAge bounds how long a completed run's file channel stays on disk.
+// It is the single source of truth for rly's 7-day retention period; the core
+// service and the CLI import it rather than redefining their own constants.
+const MaxChannelAge = 7 * 24 * time.Hour
+
+// maxChannelAge is the package-internal alias used by pruning.
+const maxChannelAge = MaxChannelAge
+
+// PruneStaleRunDirectories removes freebuff channel directories named
+// run-<id> that have not been modified within the age limit, so old prompt,
+// status, result, and trace files do not accumulate in the workspace forever.
+// Everything else under .rly/freebuff is left untouched. A missing root is
+// normal and returns zero; removal errors for a single directory are skipped
+// so one undeletable leftover never blocks the caller.
+func PruneStaleRunDirectories(workspace string, cutoff time.Time) (int, error) {
+	root := filepath.Join(workspace, ".rly", "freebuff")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	pruned := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "run-") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			if os.RemoveAll(path) == nil {
+				pruned++
+			}
+		}
+	}
+	return pruned, nil
 }
 
 func (c *channel) PromptPath() string   { return filepath.Join(c.Dir, promptFileName) }
@@ -157,75 +198,25 @@ func (c *channel) readResult() (string, error) {
 	return string(data), nil
 }
 
-// nativeResponse is a fallback for Freebuff sessions that complete normally
-// but do not follow Relay's optional status.md/result.md reporting protocol.
-// Freebuff persists each chat under ~/.config/manicode/projects/<repo>/chats;
-// matching the submitted pointer prevents an older conversation from being
-// mistaken for the current run.
-func (c *channel) nativeResponse(since time.Time) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	chatRoot := filepath.Join(home, ".config", "manicode", "projects", filepath.Base(c.Workspace), "chats")
-	entries, err := os.ReadDir(chatRoot)
-	if err != nil {
-		return ""
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		path := filepath.Join(chatRoot, entry.Name(), "chat-messages.json")
-		info, err := os.Stat(path)
-		if err != nil || info.ModTime().Before(since) {
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var messages []nativeMessage
-		if json.Unmarshal(data, &messages) != nil {
-			continue
-		}
-		matched := false
-		response := ""
-		for _, message := range messages {
-			if message.Variant == "user" && strings.Contains(message.Content, c.PromptPath()) {
-				matched = true
-				continue
-			}
-			if matched && message.Variant == "ai" {
-				var b strings.Builder
-				for _, block := range message.Blocks {
-					if block.Type == "text" {
-						b.WriteString(block.Content)
-					}
-				}
-				if b.Len() > 0 {
-					response = b.String()
-				}
-			}
-		}
-		if matched && strings.TrimSpace(response) != "" {
-			return strings.TrimSpace(response)
-		}
-	}
-	return ""
+func (c *channel) nativePromptSubmitted(since time.Time) bool {
+	submitted, _ := c.nativePromptStatus(since)
+	return submitted
 }
 
-func (c *channel) nativePromptSubmitted(since time.Time) bool {
+// nativePromptStatus reports whether the pointer was recorded by Freebuff's
+// native chat history, together with enough context to distinguish a missing
+// chat database from a prompt that was recorded but never acted on.
+func (c *channel) nativePromptStatus(since time.Time) (bool, string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("home_dir_error=%q", err)
 	}
 	chatRoot := filepath.Join(home, ".config", "manicode", "projects", filepath.Base(c.Workspace), "chats")
 	entries, err := os.ReadDir(chatRoot)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("chat_root=%q read_error=%q", chatRoot, err)
 	}
+	chatFiles := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -235,6 +226,7 @@ func (c *channel) nativePromptSubmitted(since time.Time) bool {
 		if err != nil || info.ModTime().Before(since) {
 			continue
 		}
+		chatFiles++
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -245,11 +237,26 @@ func (c *channel) nativePromptSubmitted(since time.Time) bool {
 		}
 		for _, message := range messages {
 			if message.Variant == "user" && strings.Contains(message.Content, c.PromptPath()) {
-				return true
+				return true, fmt.Sprintf("chat_root=%q chat_file=%q chat_files=%d", chatRoot, path, chatFiles)
 			}
 		}
 	}
-	return false
+	return false, fmt.Sprintf("chat_root=%q chat_files=%d matching_prompt=0", chatRoot, chatFiles)
+}
+
+// fileState is intentionally compact because it is included in periodic
+// heartbeat traces. It tells us whether the file-channel protocol is moving
+// even when the vendor TUI is silent.
+func (c *channel) fileState() string {
+	return fmt.Sprintf("accepted=%s status=%s result=%s", c.fileInfo(c.AcceptedPath()), c.fileInfo(c.StatusPath()), c.fileInfo(c.ResultPath()))
+}
+
+func (c *channel) fileInfo(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "missing"
+	}
+	return fmt.Sprintf("%dB@%s", info.Size(), info.ModTime().Format(time.RFC3339))
 }
 
 type nativeMessage struct {

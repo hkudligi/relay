@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/harsha/relay/internal/agents"
 )
@@ -43,6 +44,11 @@ func (a *Adapter) run(ctx context.Context, session string, r agents.Request) (ag
 	}
 	if r.Sandbox == agents.SandboxReadOnly {
 		args = append(args, "--mode", "plan")
+	} else {
+		// Do not rely on Agy's default mode for implementation tasks. Without
+		// an explicit write mode, the model can inspect the repository and
+		// return SUCCESS without ever applying the requested edits.
+		args = append(args, "--mode", "accept-edits")
 	}
 	args = append(args, "--sandbox")
 	return agents.StartProcess(ctx, a.Command, args, r.Workspace, normalize)
@@ -63,15 +69,23 @@ func commonUsage(u usage) agents.Usage {
 func normalize(line []byte) (agents.Event, bool, error) {
 	var raw struct {
 		Event          string `json:"event"`
+		Model          string `json:"model"`
 		ConversationID string `json:"conversation_id"`
+		Message        string `json:"message"`
+		ErrorMessage   string `json:"error_message"`
+		Error          string `json:"error"`
 		Init           struct {
 			ConversationID string `json:"conversation_id"`
+			Model          string `json:"model"`
 		} `json:"init"`
 		Step struct {
-			StepType string `json:"step_type"`
-			State    string `json:"state"`
-			Text     string `json:"text_delta"`
-			Usage    usage  `json:"usage"`
+			StepType     string `json:"step_type"`
+			State        string `json:"state"`
+			Text         string `json:"text_delta"`
+			Message      string `json:"message"`
+			Error        string `json:"error"`
+			ErrorMessage string `json:"error_message"`
+			Usage        usage  `json:"usage"`
 		} `json:"step_update"`
 		Result struct {
 			ConversationID string `json:"conversation_id"`
@@ -90,13 +104,43 @@ func normalize(line []byte) (agents.Event, bool, error) {
 		if id == "" {
 			id = raw.Init.ConversationID
 		}
-		return agents.Event{Kind: agents.EventSession, Type: raw.Event, SessionID: id}, true, nil
+		model := raw.Model
+		if model == "" {
+			model = raw.Init.Model
+		}
+		data := map[string]any{}
+		if model != "" {
+			data["model"] = model
+		}
+		return agents.Event{Kind: agents.EventSession, Type: raw.Event, SessionID: id, Data: data}, true, nil
 	case "step_update":
+		message := raw.Step.Text
+		if message == "" {
+			message = raw.Step.Message
+		}
+		if message == "" {
+			message = raw.Step.ErrorMessage
+		}
+		if message == "" {
+			message = raw.Step.Error
+		}
+		if message == "" {
+			message = raw.ErrorMessage
+		}
+		if message == "" {
+			message = raw.Message
+		}
+		if message == "" {
+			message = raw.Error
+		}
 		kind := agents.EventProgress
-		if raw.Step.StepType == "agent_response" && raw.Step.Text != "" {
+		switch {
+		case raw.Step.StepType == "error_message" || raw.Step.ErrorMessage != "" || raw.Step.Error != "" || strings.EqualFold(raw.Step.State, "error") || strings.EqualFold(raw.Step.State, "failed"):
+			kind = agents.EventError
+		case raw.Step.StepType == "agent_response" && message != "":
 			kind = agents.EventMessage
 		}
-		return agents.Event{Kind: kind, Type: raw.Step.StepType, Message: raw.Step.Text, Usage: commonUsage(raw.Step.Usage), Data: map[string]any{"state": raw.Step.State}}, true, nil
+		return agents.Event{Kind: kind, Type: raw.Step.StepType, Message: message, Usage: commonUsage(raw.Step.Usage), Data: map[string]any{"state": raw.Step.State}}, true, nil
 	case "result":
 		if raw.Result.Status != "SUCCESS" {
 			return agents.Event{Kind: agents.EventError, Type: raw.Result.Status, SessionID: raw.Result.ConversationID, Message: raw.Result.Error}, true, nil

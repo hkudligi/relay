@@ -7,16 +7,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/harsha/relay/internal/agents"
+	"github.com/harsha/relay/internal/agents/freebuff"
 	"github.com/harsha/relay/internal/model"
 	"github.com/harsha/relay/internal/store"
 )
 
 var ErrAgentUnavailable = fmt.Errorf("agent unavailable")
+var ErrAccessDenied = fmt.Errorf("access denied")
+var ErrCostLimitExceeded = fmt.Errorf("cost limit exceeded")
+var ErrTaskIncomplete = fmt.Errorf("task incomplete")
 
 const (
 	memoryOpen        = "<rly-memory>"
@@ -37,12 +44,53 @@ type PlanResult struct {
 	Result agents.Result `json:"result"`
 }
 
+type OperationalDashboard struct {
+	Repository     string                   `json:"repository"`
+	GeneratedAt    time.Time                `json:"generated_at"`
+	AgingThreshold string                   `json:"aging_threshold"`
+	Counts         map[model.TaskState]int  `json:"counts"`
+	Tasks          []OperationalTaskSummary `json:"tasks"`
+}
+
+type OperationalTaskSummary struct {
+	ID          string          `json:"id"`
+	State       model.TaskState `json:"state"`
+	Objective   string          `json:"objective"`
+	UpdatedAt   time.Time       `json:"updated_at"`
+	AgeSeconds  int64           `json:"age_seconds"`
+	NeedsAction bool            `json:"needs_action"`
+	Reason      string          `json:"reason,omitempty"`
+}
+
 type Service struct {
 	store *store.SQLite
 	now   func() time.Time
 }
 
 func New(s *store.SQLite) *Service { return &Service{store: s, now: time.Now} }
+
+// retentionPeriod bounds how long completed task history stays in state
+// before automatic cleanup removes it. It reuses freebuff.MaxChannelAge as the
+// single source of truth so the CLI, core, and freebuff adapters cannot drift.
+const retentionPeriod = freebuff.MaxChannelAge
+
+// CleanupOldRuns deletes task history older than the 7-day retention period
+// from the state database. It is called automatically on every CLI invocation
+// so the state database never grows without bound; failures are returned but
+// never fatal for the caller's actual command.
+func (s *Service) CleanupOldRuns(ctx context.Context) (int64, error) {
+	return s.CleanupOldRunsWithRetention(ctx, retentionPeriod)
+}
+
+// CleanupOldRunsWithRetention prunes task history updated before now minus
+// the retention period. The retention parameter exists for tests and future
+// configuration paths; production callers use CleanupOldRuns.
+func (s *Service) CleanupOldRunsWithRetention(ctx context.Context, retention time.Duration) (int64, error) {
+	if retention < 0 {
+		return 0, fmt.Errorf("retention period must not be negative: %s", retention)
+	}
+	return s.store.PruneOldRuns(ctx, s.now().UTC().Add(-retention))
+}
 
 func (s *Service) StartTask(ctx context.Context, repo, objective string) (*model.Task, error) {
 	return s.startTask(ctx, repo, objective, nil, false)
@@ -74,7 +122,47 @@ func (s *Service) startTask(ctx context.Context, repo, objective string, invento
 	if err := s.store.Transition(ctx, id, model.TaskCreated, model.TaskPlanning, e); err != nil {
 		return nil, err
 	}
-	return s.store.Task(ctx, id)
+	task, err := s.store.Task(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := initializeTaskArtifacts(*task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func initializeTaskArtifacts(task model.Task) error {
+	info, err := os.Stat(task.Repository)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect repository for task artifacts: %w", err)
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	root := filepath.Join(task.Repository, ".relay", "tasks", task.ID)
+	for _, dir := range []string{root, filepath.Join(root, "evidence"), filepath.Join(root, "handoffs")} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create task artifact directory %s: %w", dir, err)
+		}
+	}
+	files := map[string]string{
+		"objective.md": fmt.Sprintf("# Objective\n\n%s\n\n## Acceptance Criteria\n\n- [ ] Define concrete acceptance criteria before implementation completes.\n", task.Objective),
+		"plan.md":      "# Plan\n\n- [ ] Capture phases, dependencies, likely files, validation commands, risks, and stopping conditions.\n",
+		"decisions.md": "# Decisions\n\nNo durable decisions recorded yet.\n",
+		"findings.md":  "# Findings\n\nNo repository findings recorded yet.\n",
+		"progress.md":  "# Progress\n\n- [x] Task artifact workspace initialized.\n- [ ] Record completed work, remaining work, and the next recommended action.\n",
+		"questions.md": "# Questions\n\nNo questions waiting for the user.\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o600); err != nil {
+			return fmt.Errorf("write task artifact %s: %w", name, err)
+		}
+	}
+	return writeTaskArtifactState(root, newTaskArtifactState(task))
 }
 
 func (s *Service) Status(ctx context.Context, repo string) (model.Status, error) {
@@ -86,6 +174,51 @@ func (s *Service) Status(ctx context.Context, repo string) (model.Status, error)
 }
 func (s *Service) Tasks(ctx context.Context, repo string) ([]model.Task, error) {
 	return s.store.ListTasks(ctx, repo, 20)
+}
+func (s *Service) Operations(ctx context.Context, repo string, agingThreshold time.Duration) (OperationalDashboard, error) {
+	if agingThreshold <= 0 {
+		agingThreshold = 24 * time.Hour
+	}
+	now := s.now().UTC()
+	tasks, err := s.store.ListTasks(ctx, repo, 100)
+	if err != nil {
+		return OperationalDashboard{}, err
+	}
+	dashboard := OperationalDashboard{
+		Repository:     repo,
+		GeneratedAt:    now,
+		AgingThreshold: agingThreshold.String(),
+		Counts:         make(map[model.TaskState]int),
+	}
+	for _, task := range tasks {
+		dashboard.Counts[task.State]++
+		age := now.Sub(task.UpdatedAt)
+		item := OperationalTaskSummary{
+			ID:         task.ID,
+			State:      task.State,
+			Objective:  task.Objective,
+			UpdatedAt:  task.UpdatedAt,
+			AgeSeconds: int64(age.Seconds()),
+		}
+		switch {
+		case task.State == model.TaskBlocked:
+			item.NeedsAction = true
+			item.Reason = "blocked"
+		case task.State == model.TaskWaitingForUser:
+			item.NeedsAction = true
+			item.Reason = "waiting for user"
+		case task.State == model.TaskFailed:
+			item.NeedsAction = true
+			item.Reason = "failed"
+		case !isTerminalState(task.State) && age >= agingThreshold:
+			item.NeedsAction = true
+			item.Reason = "aging"
+		}
+		if item.NeedsAction {
+			dashboard.Tasks = append(dashboard.Tasks, item)
+		}
+	}
+	return dashboard, nil
 }
 func (s *Service) Trace(ctx context.Context, id string) ([]model.Event, error) {
 	return s.store.Events(ctx, id)
@@ -115,6 +248,60 @@ func (s *Service) DeleteMemory(ctx context.Context, repository, key string) erro
 		return err
 	}
 	return s.store.ApplyMemory(ctx, repository, "", model.MemoryUpdate{Delete: []string{key}}, s.now().UTC())
+}
+
+func (s *Service) CancelTask(ctx context.Context, id, actor, reason, idempotencyKey string) (*model.Task, error) {
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		actor = "user"
+	}
+	if actor != "user" && actor != "coordinator" {
+		return nil, fmt.Errorf("%w: %s cannot cancel tasks", ErrAccessDenied, actor)
+	}
+	task, err := s.store.Task(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if idempotencyKey != "" {
+		events, err := s.store.Events(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range events {
+			if event.Data != nil && event.Data["idempotency_key"] == idempotencyKey {
+				return task, nil
+			}
+		}
+	}
+	if isTerminalState(task.State) {
+		return task, nil
+	}
+	at := s.now().UTC()
+	data := map[string]any{"from": task.State, "to": model.TaskCancelled}
+	if reason != "" {
+		data["reason"] = reason
+	}
+	if idempotencyKey != "" {
+		data["idempotency_key"] = idempotencyKey
+	}
+	summary := "task cancelled"
+	if reason != "" {
+		summary += ": " + reason
+	}
+	if err := s.store.Transition(ctx, id, task.State, model.TaskCancelled, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: at}); err != nil {
+		return nil, err
+	}
+	updated, err := s.store.Task(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := recordArtifactTransition(*updated, model.TaskCancelled, summary, at); err != nil {
+		return nil, err
+	}
+	if err := recordArtifactCancellation(*updated, actor, reason, idempotencyKey, at); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 // Route evaluates candidate agents based on token availability, capability fit,
@@ -219,6 +406,9 @@ func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Ada
 	if err := s.store.RecordRun(ctx, model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}, task.Repository); err != nil {
 		return nil, err
 	}
+	if err := recordArtifactAgentResult(*task, "planner", adapter.Name(), status, result, started, completed, nil); err != nil {
+		return nil, err
+	}
 	if result.Err != nil {
 		if IsQuotaExhausted(result.Err) {
 			_ = s.store.AppendEvent(ctx, model.Event{
@@ -262,8 +452,11 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 	if err != nil {
 		return nil, fmt.Errorf("load project memory: %w", err)
 	}
+	if err := recordArtifactCostLimit(*task, request.MaxTotalTokens); err != nil {
+		return nil, err
+	}
 
-	_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "planning.started", Actor: planner.Name(), Summary: fmt.Sprintf("planner → %s", planner.Name()), Data: map[string]any{"adapter": planner.Name(), "version": plannerInstallation.Version}, CreatedAt: s.now().UTC()})
+	_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "planning.started", Actor: planner.Name(), Summary: fmt.Sprintf("planner → %s", planner.Name()), Data: map[string]any{"adapter": planner.Name(), "model": plannerModel, "version": plannerInstallation.Version, "role": "planner"}, CreatedAt: s.now().UTC()})
 	currentTask, err := s.store.Task(ctx, task.ID)
 	if err != nil {
 		return nil, err
@@ -272,18 +465,30 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 	if fromState != model.TaskPlanning && fromState != model.TaskFailed && fromState != model.TaskCreated {
 		fromState = model.TaskPlanning
 	}
-	if err := s.transition(ctx, task.ID, fromState, model.TaskRunning, "orchestrator", fmt.Sprintf("orchestrator → %s → %s", planner.Name(), executor.Name()), map[string]any{"planner": planner.Name(), "executor": executor.Name(), "planner_version": plannerInstallation.Version, "executor_version": executorInstallation.Version}); err != nil {
+	if err := s.transition(ctx, task.ID, fromState, model.TaskRunning, "orchestrator", fmt.Sprintf("orchestrator → planner %s → implementer %s", planner.Name(), executor.Name()), map[string]any{"planner": planner.Name(), "executor": executor.Name(), "planner_model": plannerModel, "executor_model": request.Model, "planner_version": plannerInstallation.Version, "executor_version": executorInstallation.Version}); err != nil {
 		return nil, err
 	}
 
 	request.Workspace = task.Repository
-	request.Prompt = composePrompt(task.Objective, memory)
+	request.Prompt = composeExecutionPrompt(task.Objective, memory, planner.Name())
+	if executor.Name() == "freebuff" {
+		request.Prompt += DelegationInstructions()
+	}
+	agentTasks := []AgentTask{
+		{ID: "plan", Agent: "planner", Request: agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: plannerModel, Sandbox: agents.SandboxReadOnly}, ReadOnly: true},
+		{ID: "execute", Agent: "executor", Request: request, DependsOn: []string{"plan"}, ReadOnly: false},
+	}
+	decision := AssessDurableOrchestration(agentTasks, DurableOrchestrationHints{})
+	if err := s.recordOrchestrationDecision(ctx, *task, decision); err != nil {
+		return nil, err
+	}
 	orchestrator := Orchestrator{
 		Adapters: map[string]agents.Adapter{
 			"planner":  sanitizedPlannerAdapter{Adapter: planner},
 			"executor": executor,
 		},
-		Mode: ExecutionSequential,
+		Mode:        ExecutionSequential,
+		TokenBudget: TokenBudget{MaxTotalTokens: request.MaxTotalTokens},
 		OnEvent: func(agentTask AgentTask, event agents.Event) {
 			if agentTask.ID == "plan" {
 				if event.Kind == agents.EventMessage {
@@ -314,10 +519,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 			}
 		},
 	}
-	orchestration, runErr := orchestrator.Run(ctx, []AgentTask{
-		{ID: "plan", Agent: "planner", Request: agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: plannerModel, Sandbox: agents.SandboxReadOnly}, ReadOnly: true},
-		{ID: "execute", Agent: "executor", Request: request, DependsOn: []string{"plan"}, ReadOnly: false},
-	})
+	orchestration, runErr := orchestrator.Run(ctx, agentTasks)
 	var planResult, execResult *AgentTaskResult
 	for i := range orchestration.Results {
 		result := &orchestration.Results[i]
@@ -329,7 +531,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 		}
 	}
 	if planResult != nil {
-		if err := s.recordAgentRun(ctx, task, planner.Name(), *planResult); err != nil {
+		if err := s.recordAgentRun(ctx, task, "planner", planner.Name(), *planResult); err != nil {
 			return nil, err
 		}
 		if planResult.Result.Err != nil {
@@ -349,7 +551,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 	}
 	cleanResponse, memoryUpdate := parseMemoryUpdate(execResult.Result.Response)
 	execResult.Result.Response = cleanResponse
-	if err := s.recordAgentRun(ctx, task, executor.Name(), *execResult); err != nil {
+	if err := s.recordAgentRun(ctx, task, "implementer", executor.Name(), *execResult); err != nil {
 		return nil, err
 	}
 	state := model.TaskCompleted
@@ -408,12 +610,27 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	if err := s.transition(ctx, task.ID, fromState, model.TaskRunning, "router", fmt.Sprintf("implementer → %s", adapter.Name()), map[string]any{"adapter": adapter.Name(), "version": installation.Version}); err != nil {
 		return nil, err
 	}
+	if err := s.recordOrchestrationDecision(ctx, *task, localOrchestrationDecision()); err != nil {
+		return nil, err
+	}
 	objective := task.Objective
 	if strings.TrimSpace(request.Prompt) != "" {
 		objective = request.Prompt
 	}
 	request.Prompt = composePrompt(objective, memory)
+	if err := recordArtifactCostLimit(*task, request.MaxTotalTokens); err != nil {
+		return nil, err
+	}
+	if request.MaxTotalTokens > 0 && estimatePromptUsage(request.Prompt).TotalTokens > request.MaxTotalTokens {
+		err := fmt.Errorf("%w: estimated prompt tokens exceed max_total_tokens", ErrCostLimitExceeded)
+		s.failExecution(ctx, task.ID, adapter.Name(), err)
+		return nil, err
+	}
+	if adapter.Name() == "freebuff" {
+		request.Prompt += DelegationInstructions()
+	}
 	request.Workspace = task.Repository
+	beforeWorkspace, canCheckWorkspace := workspaceStatus(ctx, task.Repository)
 	run, err := adapter.Start(ctx, request)
 	if err != nil {
 		s.failExecution(ctx, task.ID, adapter.Name(), err)
@@ -434,6 +651,12 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 		}
 	}
 	result := run.Wait()
+	if result.Err == nil && canCheckWorkspace && request.Sandbox == agents.SandboxWorkspaceWrite {
+		afterWorkspace, afterOK := workspaceStatus(ctx, task.Repository)
+		if afterOK && afterWorkspace == beforeWorkspace {
+			result.Err = fmt.Errorf("%w: agent exited successfully without changing the repository", ErrTaskIncomplete)
+		}
+	}
 	cleanResponse, memoryUpdate := parseMemoryUpdate(result.Response)
 	result.Response = cleanResponse
 	completed := s.now().UTC()
@@ -456,6 +679,9 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	}
 	record := model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}
 	if err := s.store.RecordRun(ctx, record, task.Repository); err != nil {
+		return nil, err
+	}
+	if err := recordArtifactAgentResult(*task, "implementer", adapter.Name(), status, result, started, completed, nil); err != nil {
 		return nil, err
 	}
 	if result.Err == nil && (len(memoryUpdate.Upsert) > 0 || len(memoryUpdate.Delete) > 0) {
@@ -483,6 +709,22 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	return execution, nil
 }
 
+// workspaceStatus returns a stable snapshot of tracked and untracked changes.
+// It is intentionally best-effort: non-git workspaces keep the provider's
+// normal completion behavior because Relay cannot safely infer repository
+// changes there.
+func workspaceStatus(ctx context.Context, workspace string) (string, bool) {
+	if strings.TrimSpace(workspace) == "" {
+		return "", false
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", workspace, "status", "--porcelain=v1", "--untracked-files=all")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", false
+	}
+	return string(output), true
+}
+
 func composePrompt(objective string, memory []model.ProjectMemory) string {
 	var b strings.Builder
 	b.WriteString(objective)
@@ -504,7 +746,12 @@ func composePrompt(objective string, memory []model.ProjectMemory) string {
 }
 
 func composePlanPrompt(objective string, memory []model.ProjectMemory) string {
-	return composePrompt(objective, memory) + "\n\nYou are the planning specialist. This is a read-only analysis phase. Analyze the repository and produce a concrete, ordered implementation plan for another agent. Do not edit files, do not run implementation commands, do not verify by attempting the requested change, and do not claim that you created or changed anything. If the objective asks for implementation, describe the exact commands or edits the executor should perform instead. Do not include a <rly-memory> block."
+	return composePrompt(objective, memory) + "\n\nYou are the planning specialist. This is a read-only analysis phase. Analyze the repository and produce a concrete, ordered implementation handoff for another agent.\n\nRole boundary:\n- You may inspect and reason about files, but you must not edit files, run implementation commands, run validation as proof of a change, or create artifacts.\n- Do not claim that you created, changed, fixed, tested, or completed anything.\n- If the objective asks for implementation, describe the exact edits and commands the executor should perform instead.\n- Write the handoff as instructions for the executor, not as a completion report.\n\nHandoff format:\n1. Relevant files and current behavior\n2. Ordered implementation steps\n3. Validation commands the executor should run\n4. Risks or edge cases\n\nDo not include a <rly-memory> block."
+}
+
+func composeExecutionPrompt(objective string, memory []model.ProjectMemory, plannerName string) string {
+	prompt := composePrompt(objective, memory)
+	return prompt + fmt.Sprintf("\n\nYou are the implementation specialist. The planner (%s) may provide read-only guidance in the inter-agent context below, but you are responsible for making the actual repository changes, running appropriate validation, and reporting what you changed. Treat planner text as guidance, not as evidence that work has already been completed.", plannerName)
 }
 
 func parseMemoryUpdate(response string) (string, model.MemoryUpdate) {
@@ -581,12 +828,12 @@ func memoryUpdateKeys(update model.MemoryUpdate) []string {
 	return keys
 }
 
-func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, adapter string, result AgentTaskResult) error {
+func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, role, adapter string, result AgentTaskResult) error {
 	status := "COMPLETED"
 	if result.Result.Err != nil || result.Error != "" || result.Skipped {
 		status = "FAILED"
 	}
-	return s.store.RecordRun(ctx, model.RunRecord{
+	if err := s.store.RecordRun(ctx, model.RunRecord{
 		ID:          newID("run"),
 		TaskID:      task.ID,
 		Adapter:     adapter,
@@ -597,7 +844,31 @@ func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, adapter 
 		Usage:       map[string]any{"input_tokens": result.Result.Usage.InputTokens, "cached_tokens": result.Result.Usage.CachedTokens, "output_tokens": result.Result.Usage.OutputTokens, "reasoning_tokens": result.Result.Usage.ReasoningTokens, "total_tokens": result.Result.Usage.TotalTokens},
 		StartedAt:   result.StartedAt,
 		CompletedAt: result.CompletedAt,
-	}, task.Repository)
+	}, task.Repository); err != nil {
+		return err
+	}
+	return recordArtifactAgentResult(*task, role, adapter, status, result.Result, result.StartedAt, result.CompletedAt, map[string]any{"orchestrator_task_id": result.TaskID, "skipped": result.Skipped})
+}
+
+func (s *Service) recordOrchestrationDecision(ctx context.Context, task model.Task, decision DurableOrchestrationDecision) error {
+	if err := recordArtifactOrchestrationDecision(task, decision); err != nil {
+		return err
+	}
+	_ = s.store.AppendEvent(ctx, model.Event{
+		ID:      newID("evt"),
+		TaskID:  task.ID,
+		Type:    "orchestration.selected",
+		Actor:   "orchestrator",
+		Summary: fmt.Sprintf("orchestration backend selected: %s", decision.Backend),
+		Data: map[string]any{
+			"backend":      decision.Backend,
+			"durable":      decision.Durable,
+			"reasons":      decision.Reasons,
+			"requirements": decision.Requirements,
+		},
+		CreatedAt: s.now().UTC(),
+	})
+	return nil
 }
 
 type sanitizedPlannerAdapter struct {
@@ -638,7 +909,15 @@ func (r sanitizedPlannerRun) Wait() agents.Result {
 }
 
 func (s *Service) transition(ctx context.Context, id string, from, to model.TaskState, actor, summary string, data map[string]any) error {
-	return s.store.Transition(ctx, id, from, to, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: s.now().UTC()})
+	at := s.now().UTC()
+	if err := s.store.Transition(ctx, id, from, to, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: at}); err != nil {
+		return err
+	}
+	task, err := s.store.Task(ctx, id)
+	if err != nil {
+		return err
+	}
+	return recordArtifactTransition(*task, to, summary, at)
 }
 func (s *Service) failExecution(ctx context.Context, id, actor string, cause error) {
 	_ = s.transition(ctx, id, model.TaskRunning, model.TaskFailed, actor, "agent failed to start: "+cause.Error(), nil)

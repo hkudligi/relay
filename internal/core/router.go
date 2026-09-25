@@ -23,10 +23,11 @@ const (
 )
 
 type RoutingPolicy struct {
-	Strategy           string  `json:"strategy"`
-	MinReservePercent  float64 `json:"min_reserve_percent"`
-	UnknownQuota       string  `json:"unknown_quota"`
-	RequireFileEditing bool    `json:"require_file_editing"`
+	Strategy           string             `json:"strategy"`
+	MinReservePercent  float64            `json:"min_reserve_percent"`
+	UnknownQuota       string             `json:"unknown_quota"`
+	RequireFileEditing bool               `json:"require_file_editing"`
+	AgentWeights       map[string]float64 `json:"agent_weights,omitempty"`
 }
 
 func DefaultRoutingPolicy() RoutingPolicy {
@@ -37,6 +38,7 @@ func DefaultRoutingPolicy() RoutingPolicy {
 		// UNKNOWN row can represent an expired provider just as easily as an
 		// available one; callers can still explicitly select that adapter.
 		UnknownQuota: "deny",
+		AgentWeights: map[string]float64{"agy": 1.0, "codex": 0.9, "cursor": 0.8, "freebuff": 0.0},
 	}
 }
 
@@ -192,20 +194,34 @@ func evaluateCandidate(
 	// 4. Weight calculation based on strategy
 	wCap, wSession, wQuota, wRel, wCost := strategyWeights(policy.Strategy)
 	rawScore := (wCap * capabilityFit) + (wSession * sessionValue) + (wQuota * quotaHeadroom) + (wRel * score.Reliability) + (wCost * score.CostFit)
+	score.AgentWeight = agentWeight(name, policy.AgentWeights)
 
-	score.TotalScore = math.Round(rawScore*1000) / 1000
+	score.TotalScore = math.Round(rawScore*score.AgentWeight*1000) / 1000
 	score.Eligible = true
 	return score
+}
+
+func agentWeight(agent string, configured map[string]float64) float64 {
+	if configured != nil {
+		if weight, ok := configured[strings.ToLower(agent)]; ok && weight > 0 {
+			return weight
+		}
+	}
+	if weight, ok := DefaultRoutingPolicy().AgentWeights[strings.ToLower(agent)]; ok {
+		return weight
+	}
+	return 1.0
 }
 
 func evaluateQuota(agent string, rows []agents.ModelAvailability, policy RoutingPolicy) (float64, *float64, string, bool, string) {
 	if len(rows) == 0 {
 		switch policy.UnknownQuota {
 		case "deny":
-			// Freebuff publishes named models but exposes no quota API. Treat that
-			// catalog as routable with unknown headroom; an actual UNKNOWN row is
-			// still denied, as are other providers without measured quota.
-			if agent == "freebuff" && hasNamedUsableModel(rows) {
+			// Some agents (agy, freebuff) publish named models but expose no
+			// quota API. Treat any agent that has named usable models as
+			// routable with unknown headroom; only deny agents that have no
+			// model catalog at all.
+			if hasNamedUsableModel(rows) {
 				return 0.80, nil, agents.ConfidenceUnknown, true, ""
 			}
 			return 0, nil, agents.ConfidenceUnknown, false, "unknown quota denied by policy"
@@ -292,10 +308,11 @@ func evaluateQuota(agent string, rows []agents.ModelAvailability, policy Routing
 
 	switch policy.UnknownQuota {
 	case "deny":
-		// Freebuff publishes named models but exposes no quota API. Treat that
-		// catalog as routable with unknown headroom; an actual UNKNOWN row is
-		// still denied, as are other providers without measured quota.
-		if agent == "freebuff" && hasNamedUsableModel(rows) {
+		// Some agents (agy, freebuff) publish named models but expose no
+		// quota API. Treat any agent that has named usable models as
+		// routable with unknown headroom; only deny agents that have no
+		// model catalog at all.
+		if hasNamedUsableModel(rows) {
 			return 0.80, nil, agents.ConfidenceUnknown, true, ""
 		}
 		return 0, nil, agents.ConfidenceUnknown, false, "unknown quota denied by policy"
@@ -362,12 +379,17 @@ func IsQuotaExhaustedMessage(msg string) bool {
 		"hit your usage limit",
 		"quota exhausted",
 		"token quota exhausted",
+		"capacity exhausted",
+		"no capacity",
+		"at capacity",
+		"over capacity",
+		"model capacity",
+		"server is busy",
 		"insufficient quota",
 		"exceeded your current quota",
 		"resource_exhausted",
 		"rate limit",
 		"rate_limit",
-		"429",
 		"purchase more credits",
 		"upgrade to pro",
 		"daily session limit",
@@ -378,7 +400,55 @@ func IsQuotaExhaustedMessage(msg string) bool {
 			return true
 		}
 	}
+	return containsToken(msg, "429")
+}
+
+// IsModelSelectionError reports provider failures where retrying the same
+// model is unlikely to help. Callers can remove the failed model and try the
+// next discovered model.
+func IsModelSelectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, pattern := range []string{
+		"model is unavailable",
+		"model unavailable",
+		"model not found",
+		"unknown model",
+		"invalid model",
+		"unsupported model",
+		"model does not exist",
+		"failed to load model",
+		"failed to initialize model",
+	} {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
 	return false
+}
+
+func containsToken(msg, token string) bool {
+	for start := 0; start < len(msg); {
+		idx := strings.Index(msg[start:], token)
+		if idx == -1 {
+			return false
+		}
+		idx += start
+		beforeOK := idx == 0 || !isTokenChar(msg[idx-1])
+		after := idx + len(token)
+		afterOK := after == len(msg) || !isTokenChar(msg[after])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = after
+	}
+	return false
+}
+
+func isTokenChar(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_'
 }
 
 func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilities) float64 {

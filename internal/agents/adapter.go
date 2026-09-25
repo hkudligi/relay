@@ -100,6 +100,10 @@ type Request struct {
 	Model        string
 	Sandbox      Sandbox
 	SkipGitCheck bool
+	// MaxTotalTokens is an optional coordinator guardrail. Adapters may ignore
+	// it; the core service and orchestrator enforce it before launch where
+	// prompt usage can be estimated.
+	MaxTotalTokens int64
 }
 
 type Usage struct {

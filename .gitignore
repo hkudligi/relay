@@ -4,3 +4,9 @@
 *.db-wal
 /.rly
 bin/rly
+homebrew/bin/rly
+.agent/
+.claude/
+.codex/
+/.tmp
+/.relay

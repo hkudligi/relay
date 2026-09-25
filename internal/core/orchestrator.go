@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,10 @@ type AgentTask struct {
 	DependsOn   []string
 	ReadOnly    bool
 	ContextFrom []string
+	// ParallelSafe allows a mutating task to run with other mutating tasks when
+	// WorkspacePaths prove that their ownership boundaries do not overlap.
+	ParallelSafe   bool
+	WorkspacePaths []string
 }
 
 type AgentTaskResult struct {
@@ -233,15 +238,61 @@ func chooseBatch(ready []AgentTask, mode ExecutionMode, limit int) []AgentTask {
 	if mode == ExecutionSequential {
 		return ready[:1]
 	}
-	// Parallel and auto modes fan out only independent read-only work. A
-	// mutating task is always isolated in its own batch to protect the shared
-	// workspace, even when the caller requests parallel scheduling.
+	// Parallel and auto modes fan out independent read-only work. Mutating
+	// tasks may also fan out when every task explicitly opts in and declares
+	// disjoint workspace ownership.
 	for _, task := range ready {
-		if !task.ReadOnly {
+		if !task.ReadOnly && !task.ParallelSafe {
 			return []AgentTask{task}
 		}
 	}
+	if hasMutatingTask(ready) && !disjointOwnership(ready) {
+		for _, task := range ready {
+			if !task.ReadOnly {
+				return []AgentTask{task}
+			}
+		}
+	}
 	return ready[:min(limit, len(ready))]
+}
+
+func hasMutatingTask(tasks []AgentTask) bool {
+	for _, task := range tasks {
+		if !task.ReadOnly {
+			return true
+		}
+	}
+	return false
+}
+
+func disjointOwnership(tasks []AgentTask) bool {
+	for i := range tasks {
+		if tasks[i].ReadOnly || len(tasks[i].WorkspacePaths) == 0 {
+			if !tasks[i].ReadOnly {
+				return false
+			}
+			continue
+		}
+		for j := i + 1; j < len(tasks); j++ {
+			if tasks[j].ReadOnly {
+				continue
+			}
+			for _, left := range tasks[i].WorkspacePaths {
+				for _, right := range tasks[j].WorkspacePaths {
+					if pathsOverlap(left, right) {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+func pathsOverlap(left, right string) bool {
+	left = filepath.ToSlash(filepath.Clean(left))
+	right = filepath.ToSlash(filepath.Clean(right))
+	return left == right || strings.HasPrefix(left, right+"/") || strings.HasPrefix(right, left+"/")
 }
 
 func (o Orchestrator) runBatch(ctx context.Context, tasks []AgentTask) ([]AgentTaskResult, bool) {

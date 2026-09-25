@@ -158,7 +158,7 @@ func TestRouteOptimizesForEfficacyByRole(t *testing.T) {
 		t.Fatalf("expected agy to be selected for planning efficacy, got %s", planDecision.SelectedAgent)
 	}
 
-	// For implementation role, Codex has higher coding efficacy
+	// The default agent priority places AGY ahead of Codex.
 	implDecision, err := core.Route(
 		context.Background(),
 		core.RoleImplementation,
@@ -171,8 +171,8 @@ func TestRouteOptimizesForEfficacyByRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route implementation error: %v", err)
 	}
-	if implDecision.SelectedAgent != "codex" {
-		t.Fatalf("expected codex to be selected for implementation efficacy, got %s", implDecision.SelectedAgent)
+	if implDecision.SelectedAgent != "agy" {
+		t.Fatalf("expected agy to be selected for implementation priority, got %s", implDecision.SelectedAgent)
 	}
 }
 
@@ -244,9 +244,32 @@ func TestRouteQualityFirstStrategyPrioritizesEfficacy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("route error: %v", err)
 	}
-	// Under quality-first strategy, Codex's higher implementation efficacy wins
-	if decision.SelectedAgent != "codex" {
-		t.Fatalf("expected codex to be selected under quality-first strategy, got %s", decision.SelectedAgent)
+	// Agent priority weights keep AGY ahead of Codex under the default settings.
+	if decision.SelectedAgent != "agy" {
+		t.Fatalf("expected agy to be selected under quality-first strategy, got %s", decision.SelectedAgent)
+	}
+}
+
+func TestRouteAgentWeightsAreConfigurable(t *testing.T) {
+	quota := 80.0
+	adapters := map[string]agents.Adapter{
+		"agy":      &mockAdapter{name: "agy", available: true, caps: agents.Capabilities{FileEditing: true}},
+		"codex":    &mockAdapter{name: "codex", available: true, caps: agents.Capabilities{FileEditing: true}},
+		"freebuff": &mockAdapter{name: "freebuff", available: true, caps: agents.Capabilities{FileEditing: true}},
+	}
+	inventory := []agents.ModelAvailability{
+		{Agent: "agy", Model: "m", Installed: true, Usable: true, RemainingPercent: &quota, Confidence: agents.ConfidenceExact},
+		{Agent: "codex", Model: "m", Installed: true, Usable: true, RemainingPercent: &quota, Confidence: agents.ConfidenceExact},
+		{Agent: "freebuff", Model: "m", Installed: true, Usable: true, RemainingPercent: &quota, Confidence: agents.ConfidenceExact},
+	}
+	policy := core.DefaultRoutingPolicy()
+	policy.AgentWeights = map[string]float64{"agy": 0.5, "codex": 0.6, "freebuff": 2.0}
+	decision, err := core.Route(context.Background(), core.RoleImplementation, "implement feature", adapters, inventory, "", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.SelectedAgent != "freebuff" {
+		t.Fatalf("selected = %s, want configured highest-weight freebuff", decision.SelectedAgent)
 	}
 }
 
@@ -371,5 +394,67 @@ func TestRouteFallsBackToLunaReserveWhenOrdinaryQuotaIsExhausted(t *testing.T) {
 	}
 	if decision.SelectedAgent != "codex" || decision.SelectedModel != "gpt-reserve" {
 		t.Fatalf("selected = %s %s, want codex gpt-reserve", decision.SelectedAgent, decision.SelectedModel)
+	}
+}
+
+func TestIsQuotaExhaustedMessageMatches429AsTokenOnly(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{
+			name: "status code token",
+			msg:  "request failed with status 429",
+			want: true,
+		},
+		{
+			name: "http status punctuation",
+			msg:  "HTTP 429: too many requests",
+			want: true,
+		},
+		{
+			name: "punctuated token",
+			msg:  "provider returned (429)",
+			want: true,
+		},
+		{
+			name: "path fragment",
+			msg:  "failed to read /tmp/1429cache/result.json",
+			want: false,
+		},
+		{
+			name: "version string",
+			msg:  "adapter version v429beta exited",
+			want: false,
+		},
+		{
+			name: "identifier",
+			msg:  "retry id job_429_limit completed",
+			want: false,
+		},
+		{
+			name: "quota phrase still matches",
+			msg:  "insufficient quota for this request",
+			want: true,
+		},
+		{
+			name: "provider capacity exhaustion",
+			msg:  "model is at capacity; please retry with another model",
+			want: true,
+		},
+		{
+			name: "provider no capacity",
+			msg:  "no capacity available for this model",
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := core.IsQuotaExhaustedMessage(tt.msg); got != tt.want {
+				t.Fatalf("IsQuotaExhaustedMessage(%q) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
 	}
 }

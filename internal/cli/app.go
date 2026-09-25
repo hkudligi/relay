@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/harsha/relay/internal/agents"
 	"github.com/harsha/relay/internal/agents/agy"
@@ -22,6 +23,10 @@ import (
 	"github.com/harsha/relay/internal/model"
 	"github.com/harsha/relay/internal/store"
 )
+
+// freebuffMaxChannelAge reuses freebuff.MaxChannelAge so the cleanup message
+// and the pruning window can never drift apart.
+const freebuffMaxChannelAge = freebuff.MaxChannelAge
 
 const (
 	ExitOK               = 0
@@ -72,11 +77,33 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	}
 	repo, _ = filepath.Abs(repo)
 	svc := core.New(db)
+	a.cleanup(ctx, svc, repo)
 	rest := root.Args()
 	if len(rest) == 0 {
 		return a.repl(ctx, svc, repo)
 	}
 	return a.command(ctx, svc, repo, rest)
+}
+
+// cleanup removes old run history automatically before every CLI command so
+// the state database and workspace channel files never grow without bound.
+// SQLite task history uses the 7-day retention period from core. Freebuff
+// channel directories under the workspace's .rly/freebuff root use the same
+// period inside the freebuff package. Both are best-effort: a cleanup failure
+// is reported but never blocks the requested command. All cleanup output goes
+// to standard error so --json consumers always receive machine-readable data
+// on standard output.
+func (a *App) cleanup(ctx context.Context, svc *core.Service, repo string) {
+	if pruned, err := svc.CleanupOldRuns(ctx); err != nil {
+		fmt.Fprintf(a.Err, "rly: cleanup old runs: %v\n", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(a.Err, "cleanup: pruned %d task(s) older than 7 days\n", pruned)
+	}
+	if pruned, err := freebuff.PruneStaleRunDirectories(repo, time.Now().Add(-freebuffMaxChannelAge)); err != nil {
+		fmt.Fprintf(a.Err, "rly: cleanup freebuff channels: %v\n", err)
+	} else if pruned > 0 {
+		fmt.Fprintf(a.Err, "cleanup: removed %d freebuff run director(y|ies) older than 7 days\n", pruned)
+	}
 }
 
 func (a *App) statePath(explicit string) (string, error) {
@@ -102,8 +129,13 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		jsonOut := fs.Bool("json", false, "emit JSON")
 		agentName := fs.String("agent", "auto", "agent adapter (codex, agy, cursor, freebuff, or auto)")
 		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, or auto; freebuff is execution-only)")
-		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy (balanced, conservative, or quality-first)")
-		minReserve := fs.Float64("min-reserve", 15.0, "minimum token reserve percentage")
+		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy: balanced, conservative, or quality-first")
+		minReserve := fs.Float64("min-reserve", 15.0, "minimum token headroom percentage to reserve before routing")
+		maxTotalTokens := fs.Int64("max-total-tokens", 0, "maximum estimated total tokens for this task")
+		agyWeight := fs.Float64("agy-weight", 1.0, "agent priority weight for Agy")
+		codexWeight := fs.Float64("codex-weight", 0.9, "agent priority weight for Codex")
+		cursorWeight := fs.Float64("cursor-weight", 0.8, "agent priority weight for Cursor")
+		freebuffWeight := fs.Float64("freebuff-weight", 0.1, "agent priority weight for Freebuff")
 		sandbox := fs.String("sandbox", string(agents.SandboxWorkspaceWrite), "sandbox mode (read-only or workspace-write)")
 		skipGit := fs.Bool("skip-git-check", false, "allow Codex outside a Git repository")
 		if err := fs.Parse(args[1:]); err != nil {
@@ -140,8 +172,11 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 			MinReservePercent:  *minReserve,
 			UnknownQuota:       "deny",
 			RequireFileEditing: (mode == agents.SandboxWorkspaceWrite),
+			AgentWeights: map[string]float64{
+				"agy": *agyWeight, "codex": *codexWeight, "cursor": *cursorWeight, "freebuff": *freebuffWeight,
+			},
 		}
-		return a.executeObjectiveWithRouter(ctx, svc, repo, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit}, *jsonOut)
+		return a.executeObjectiveWithRouter(ctx, svc, repo, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit, MaxTotalTokens: *maxTotalTokens}, *jsonOut)
 	case "agents":
 		jsonOut, ok := parseJSONOnly(args[1:], a.Err)
 		if !ok {
@@ -180,6 +215,53 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 			return a.json(ts)
 		}
 		a.printTasks(ts)
+		return ExitOK
+	case "ops":
+		fs := flag.NewFlagSet("ops", flag.ContinueOnError)
+		fs.SetOutput(a.Err)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		aging := fs.Duration("aging", 24*time.Hour, "mark non-terminal tasks older than this duration")
+		if err := fs.Parse(args[1:]); err != nil {
+			return ExitInvalid
+		}
+		if fs.NArg() != 0 {
+			fmt.Fprintln(a.Err, "unexpected arguments")
+			return ExitInvalid
+		}
+		dashboard, err := svc.Operations(ctx, repo, *aging)
+		if err != nil {
+			return a.fail(err)
+		}
+		if *jsonOut {
+			return a.json(dashboard)
+		}
+		a.printOperations(dashboard)
+		return ExitOK
+	case "cancel":
+		fs := flag.NewFlagSet("cancel", flag.ContinueOnError)
+		fs.SetOutput(a.Err)
+		reason := fs.String("reason", "", "cancellation reason")
+		idempotencyKey := fs.String("idempotency-key", "", "idempotency key for safe retries")
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return ExitInvalid
+		}
+		if fs.NArg() != 1 {
+			fmt.Fprintln(a.Err, "rly cancel: task id is required")
+			return ExitInvalid
+		}
+		task, err := svc.CancelTask(ctx, fs.Arg(0), "user", *reason, *idempotencyKey)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				fmt.Fprintf(a.Err, "task %s not found\n", fs.Arg(0))
+				return ExitInvalid
+			}
+			return a.fail(err)
+		}
+		if *jsonOut {
+			return a.json(task)
+		}
+		fmt.Fprintf(a.Out, "%s  %s\n", task.ID, task.State)
 		return ExitOK
 	case "memory":
 		return a.memoryCommand(ctx, svc, repo, args[1:])
@@ -317,6 +399,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 	}
 
 	var planner agents.Adapter
+	var plannerDecision *model.RouteDecision
 	plannerModel := ""
 	if plannerName == "auto" {
 		planningAdapters, planningInventory := planningCandidates(a.Adapters, inventory)
@@ -330,6 +413,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		}
 		planner = a.Adapters[planDecision.SelectedAgent]
 		plannerModel = planDecision.SelectedModel
+		plannerDecision = planDecision
 	} else if plannerName != "" {
 		var exists bool
 		planner, exists = a.Adapters[plannerName]
@@ -337,8 +421,9 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 			fmt.Fprintf(a.Err, "unknown planner adapter %q\n", plannerName)
 			return ExitInvalid
 		}
-		if plannerDecision, routeErr := svc.Route(ctx, t.ID, core.RolePlanning, objective, map[string]agents.Adapter{plannerName: planner}, inventory, policy); routeErr == nil {
-			plannerModel = plannerDecision.SelectedModel
+		if planDecision, routeErr := svc.Route(ctx, t.ID, core.RolePlanning, objective, map[string]agents.Adapter{plannerName: planner}, inventory, policy); routeErr == nil {
+			plannerModel = planDecision.SelectedModel
+			plannerDecision = planDecision
 		}
 	}
 
@@ -373,36 +458,62 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 	}
 
 	if !jsonOut {
-		if primaryDecision != nil && primaryDecision.SelectedAgent != "" && (agentName == "auto" || agentName == "") {
-			modelLabel := routeModelLabel(primaryDecision.SelectedModel)
-			fmt.Fprintf(a.Out, "router: %s model=%s (%s)\n", primaryDecision.SelectedAgent, modelLabel, primaryDecision.Rationale)
+		// Keep the routing summary compact and make the two actors explicit. The
+		// phase banners below are the authoritative progress display; this line
+		// gives the user the complete assignment before either process starts.
+		if planner != nil {
+			fmt.Fprintf(a.Out, "agents: planner=%s model=%s | executor=%s model=%s\n", planner.Name(), routeModelLabel(plannerModel), adapter.Name(), routeModelLabel(request.Model))
+			fmt.Fprintf(a.Out, "router: planner %s model=%s [read-only plan]\n", planner.Name(), routeModelLabel(plannerModel))
+			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
+			if plannerDecision != nil && plannerDecision.Rationale != "" {
+				fmt.Fprintf(a.Out, "routing: planner=%s (%s)\n", planner.Name(), plannerDecision.Rationale)
+			}
+			if primaryDecision != nil && primaryDecision.Rationale != "" {
+				fmt.Fprintf(a.Out, "routing: executor=%s (%s)\n", adapter.Name(), primaryDecision.Rationale)
+			}
+		} else if primaryDecision != nil && primaryDecision.Rationale != "" {
+			fmt.Fprintf(a.Out, "agents: executor=%s model=%s\nrouting: executor=%s (%s)\n", adapter.Name(), routeModelLabel(request.Model), adapter.Name(), primaryDecision.Rationale)
+			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
+		} else {
+			fmt.Fprintf(a.Out, "agents: executor=%s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
+			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
 		}
 		if planner != nil {
-			fmt.Fprintf(a.Out, "%s  %s → %s → %s\n", t.ID, t.State, planner.Name(), adapter.Name())
+			// Retain the compact flow marker for trace readability and backwards
+			// compatibility with existing terminal consumers.
+			fmt.Fprintf(a.Out, "%s  %s → planner %s (%s) → implementer %s (%s)\n", t.ID, t.State, planner.Name(), routeModelLabel(plannerModel), adapter.Name(), routeModelLabel(request.Model))
 		} else {
-			fmt.Fprintf(a.Out, "%s  %s → %s\n", t.ID, t.State, adapter.Name())
+			fmt.Fprintf(a.Out, "%s  %s → implementer %s (%s)\n", t.ID, t.State, adapter.Name(), routeModelLabel(request.Model))
 		}
 	}
 
 	emit := func(event agents.Event) {
-		if !jsonOut && event.Kind == agents.EventMessage && event.Message != "" {
-			fmt.Fprint(a.Out, event.Message)
-			if !strings.HasSuffix(event.Message, "\n") {
-				fmt.Fprintln(a.Out)
-			}
+		if !jsonOut {
+			printAgentEvent(a.Out, "executor", adapter.Name(), request.Model, event)
 		}
 	}
 
 	runExecution := func() (*core.Execution, error) {
+		executorPhasePrinted := false
+		if !jsonOut {
+			if planner != nil {
+				fmt.Fprintf(a.Out, "\nPHASE 1/2 · PLAN  | planner=%s model=%s | action=inspect repository and prepare executor handoff\n", planner.Name(), routeModelLabel(plannerModel))
+			} else {
+				fmt.Fprintf(a.Out, "\nPHASE 1/1 · EXECUTE | executor=%s model=%s | action=implement repository changes\n", adapter.Name(), routeModelLabel(request.Model))
+			}
+		}
 		if planner != nil {
 			return svc.ExecuteWithPlan(ctx, t, planner, adapter, plannerModel, request, func(event agents.Event) {
-				if !jsonOut && event.Kind == agents.EventMessage && event.Message != "" {
-					fmt.Fprint(a.Out, "[plan] "+event.Message)
-					if !strings.HasSuffix(event.Message, "\n") {
-						fmt.Fprintln(a.Out)
-					}
+				if !jsonOut {
+					printAgentEvent(a.Out, "planner", planner.Name(), plannerModel, event)
 				}
-			}, emit)
+			}, func(event agents.Event) {
+				if !jsonOut && !executorPhasePrinted {
+					fmt.Fprintf(a.Out, "\nPHASE 2/2 · EXECUTE | executor=%s model=%s | action=implement repository changes\n", adapter.Name(), routeModelLabel(request.Model))
+					executorPhasePrinted = true
+				}
+				emit(event)
+			})
 		}
 		return svc.Execute(ctx, t, adapter, request, emit)
 	}
@@ -423,39 +534,40 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 			execution, runErr = runExecution()
 		}
 	}
-	// UNKNOWN quota providers can still reject a request at runtime. Remove
-	// that adapter from the candidate set and make one transparent retry so a
-	// healthy provider (for example Codex Luna) gets a chance to run the task.
-	if runErr != nil && shouldRetryAgent(adapter, runErr) && (agentName == "auto" || agentName == "") && len(a.Adapters) > 1 {
-		// A provider can expose multiple models with separate limits. Remove
-		// only the model that rejected the request, instead of discarding the
-		// entire adapter (for example, Codex Luna may fail while another model
-		// remains available). The inventory is deliberately kept immutable for
-		// the original trace; this filtered copy is only for recovery routing.
-		selectedModel := ""
-		if primaryDecision != nil {
-			selectedModel = primaryDecision.SelectedModel
-		}
-		fallbackInventory := filterFailedModel(inventory, adapter.Name(), selectedModel)
-		fallbackAdapters := make(map[string]agents.Adapter, len(a.Adapters))
-		fallbackAgents := make(map[string]bool, len(fallbackInventory))
-		for _, item := range fallbackInventory {
-			fallbackAgents[item.Agent] = true
-		}
-		for name, candidate := range a.Adapters {
-			// If filtering removed the provider's only known model, keeping the
-			// adapter would make the router treat it as UNKNOWN quota and select
-			// it again under the default allow policy.
-			if fallbackAgents[name] {
-				fallbackAdapters[name] = candidate
+	// Providers can reject a discovered model at runtime. Remove the failed
+	// model and keep routing until another candidate succeeds or is exhausted.
+	if runErr != nil && shouldRetryAgent(adapter, runErr) {
+		fallbackInventory := inventory
+		for runErr != nil && shouldRetryAgent(adapter, runErr) {
+			selectedModel := ""
+			if primaryDecision != nil {
+				selectedModel = primaryDecision.SelectedModel
 			}
-		}
-		// Unknown quota is denied for primary routing, but a provider that could
-		// not expose quota remains a useful recovery option after a measured
-		// provider has just failed at runtime.
-		fallbackPolicy := policy
-		fallbackPolicy.UnknownQuota = "allow"
-		if fallbackDecision, routeErr := svc.Route(ctx, t.ID, core.RoleImplementation, objective, fallbackAdapters, fallbackInventory, fallbackPolicy); routeErr == nil {
+			nextInventory := filterFailedModel(fallbackInventory, adapter.Name(), selectedModel)
+			if len(nextInventory) == len(fallbackInventory) {
+				break
+			}
+			fallbackInventory = nextInventory
+			fallbackAdapters := make(map[string]agents.Adapter, len(a.Adapters))
+			fallbackAgents := make(map[string]bool, len(fallbackInventory))
+			for _, item := range fallbackInventory {
+				fallbackAgents[item.Agent] = true
+			}
+			if agentName != "auto" && agentName != "" {
+				fallbackAdapters[adapter.Name()] = adapter
+			} else {
+				for name, candidate := range a.Adapters {
+					if fallbackAgents[name] {
+						fallbackAdapters[name] = candidate
+					}
+				}
+			}
+			fallbackPolicy := policy
+			fallbackPolicy.UnknownQuota = "allow"
+			fallbackDecision, routeErr := svc.Route(ctx, t.ID, core.RoleImplementation, objective, fallbackAdapters, fallbackInventory, fallbackPolicy)
+			if routeErr != nil {
+				break
+			}
 			if !jsonOut {
 				fmt.Fprintf(a.Out, "retrying after %s %s: %s model=%s\n", adapter.Name(), retryReason(adapter, runErr), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
 			}
@@ -463,6 +575,32 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 			primaryDecision = fallbackDecision
 			request.Model = fallbackDecision.SelectedModel
 			execution, runErr = runExecution()
+		}
+	}
+	if runErr == nil && execution != nil && adapter.Name() == "freebuff" {
+		delegations, delegationErr := core.ParseDelegatedTasks(execution.Result.Response)
+		if delegationErr != nil {
+			runErr = delegationErr
+		} else if len(delegations) > 0 {
+			if !jsonOut {
+				fmt.Fprintf(a.Out, "\nDELEGATED SUBAGENTS · launching %d vendor task(s)\n", len(delegations))
+			}
+			delegatedTasks := core.DelegatedAgentTasks(delegations, repo, request.Sandbox)
+			delegated := core.Orchestrator{
+				Adapters: a.Adapters,
+				Mode:     core.ExecutionParallel,
+				OnEvent: func(task core.AgentTask, event agents.Event) {
+					if !jsonOut {
+						printAgentEvent(a.Out, "subagent/"+task.ID, task.Agent, task.Request.Model, event)
+					}
+				},
+			}
+			_, delegationErr = delegated.Run(ctx, delegatedTasks)
+			if delegationErr != nil {
+				runErr = delegationErr
+			} else if !jsonOut {
+				fmt.Fprintln(a.Out, "✓ delegated vendor tasks completed")
+			}
 		}
 	}
 
@@ -487,6 +625,54 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		fmt.Fprintf(a.Out, "✓ %s (%s)\n", execution.Task.State, execution.Result.SessionID)
 	}
 	return ExitOK
+}
+
+// printAgentEvent is the shared human-output bridge for every adapter. Vendor
+// adapters normalize streamed tool calls, lifecycle records, and text into
+// EventProgress/EventSession/EventMessage; keeping this rendering in one place
+// ensures the main terminal shows updates from Codex, Agy, Cursor, Freebuff,
+// and third-party adapters consistently.
+func printAgentEvent(out io.Writer, role, adapter, model string, event agents.Event) {
+	label := fmt.Sprintf("[%s %s model=%s]", role, adapter, routeModelLabel(model))
+	switch event.Kind {
+	case agents.EventMessage:
+		if event.Message == "" {
+			return
+		}
+		fmt.Fprintf(out, "%s %s", label, event.Message)
+		if !strings.HasSuffix(event.Message, "\n") {
+			fmt.Fprintln(out)
+		}
+	case agents.EventProgress:
+		detail := strings.TrimSpace(event.Message)
+		if detail == "" {
+			detail = strings.TrimSpace(event.Type)
+		}
+		if detail == "" {
+			return
+		}
+		if state, ok := event.Data["state"].(string); ok && state != "" && state != detail {
+			detail += " state=" + state
+		}
+		fmt.Fprintf(out, "%s progress: %s\n", label, detail)
+	case agents.EventSession:
+		actualModel, _ := event.Data["model"].(string)
+		if actualModel != "" {
+			fmt.Fprintf(out, "%s session started: %s actual_model=%s\n", label, event.SessionID, actualModel)
+			return
+		}
+		if event.SessionID != "" {
+			fmt.Fprintf(out, "%s session started: %s\n", label, event.SessionID)
+		} else {
+			fmt.Fprintf(out, "%s session started\n", label)
+		}
+	case agents.EventError:
+		if event.Message != "" {
+			fmt.Fprintf(out, "%s error: %s\n", label, event.Message)
+		} else {
+			fmt.Fprintf(out, "%s error\n", label)
+		}
+	}
 }
 
 func (a *App) discoverInventory(ctx context.Context) []agents.ModelAvailability {
@@ -525,7 +711,10 @@ func (a *App) discoverInventory(ctx context.Context) []agents.ModelAvailability 
 }
 
 func (a *App) printInventory(inventory []agents.ModelAvailability) {
-	fmt.Fprintln(a.Out, "Agent/model inventory:")
+	fmt.Fprintln(a.Out, "Model availability")
+	fmt.Fprintln(a.Out, "┌──────────┬──────────────────────────┬───────────┬────────┬────────────┬──────────┐")
+	fmt.Fprintln(a.Out, "│ Agent    │ Model                    │ Remaining │ Usable │ Confidence │ Version  │")
+	fmt.Fprintln(a.Out, "├──────────┼──────────────────────────┼───────────┼────────┼────────────┼──────────┤")
 	for _, item := range inventory {
 		remaining := "UNKNOWN"
 		if item.RemainingPercent != nil {
@@ -540,9 +729,40 @@ func (a *App) printInventory(inventory []agents.ModelAvailability) {
 		} else if agents.IsReserveModel(item.Model) {
 			label = agents.ExecutionModel(item.Model) + " (reserve)"
 		}
-		fmt.Fprintf(a.Out, "  %-8s %-24s installed=%-3s usable=%-3s remaining=%-7s confidence=%-7s version=%-12s source=%s\n",
-			item.Agent, label, yesNo(item.Installed), yesNo(item.Usable), remaining, item.Confidence, item.Version, item.DataSource)
+		if !item.Installed {
+			label = appendDetail(label, "not installed")
+		}
+		fmt.Fprintf(a.Out, "│ %-8s │ %-24s │ %-9s │ %-6s │ %-10s │ %-8s │\n",
+			fitCell(item.Agent, 8),
+			fitCell(label, 24),
+			fitCell(remaining, 9),
+			fitCell(yesNo(item.Usable), 6),
+			fitCell(item.Confidence, 10),
+			fitCell(item.Version, 8))
 	}
+	fmt.Fprintln(a.Out, "└──────────┴──────────────────────────┴───────────┴────────┴────────────┴──────────┘")
+}
+
+func appendDetail(label, detail string) string {
+	if label == "" {
+		return detail
+	}
+	return label + " (" + detail + ")"
+}
+
+func fitCell(value string, width int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width <= 1 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-1]) + "…"
 }
 
 func retryReason(adapter agents.Adapter, err error) string {
@@ -559,10 +779,10 @@ func shouldRetryAgent(adapter agents.Adapter, err error) bool {
 	if err == nil {
 		return false
 	}
-	// Freebuff is a PTY/file-channel adapter. A readiness, idle-timeout, or
-	// result-file failure is operational rather than a user task failure, so
-	// auto routing should give another installed adapter a chance.
-	return core.IsQuotaExhausted(err) || adapter.Name() == "freebuff"
+	// Agy model failures are retried against the next discovered model. Freebuff
+	// readiness, idle-timeout, and result-file failures are also operational
+	// failures that can be retried by the routing layer.
+	return errors.Is(err, core.ErrTaskIncomplete) || core.IsQuotaExhausted(err) || core.IsModelSelectionError(err) || adapter.Name() == "agy" || adapter.Name() == "freebuff"
 }
 
 func filterFailedModel(inventory []agents.ModelAvailability, agent, model string) []agents.ModelAvailability {
@@ -585,7 +805,10 @@ func filterFailedModel(inventory []agents.ModelAvailability, agent, model string
 		if model == "" || model == "UNKNOWN" {
 			continue
 		}
-		if item.Model == model {
+		// Routing IDs may include a reserve-pool suffix while adapters receive
+		// the underlying execution model. Remove only the failed pool, not a
+		// different reserve/ordinary row for the same provider model.
+		if item.Model == model || (agents.ExecutionModel(item.Model) == agents.ExecutionModel(model) && agents.IsReserveModel(item.Model) == agents.IsReserveModel(model)) {
 			continue
 		}
 		filtered = append(filtered, item)
@@ -659,6 +882,18 @@ func (a *App) printTasks(ts []model.Task) {
 	}
 }
 
+func (a *App) printOperations(dashboard core.OperationalDashboard) {
+	fmt.Fprintf(a.Out, "repo: %s\n", filepath.Base(dashboard.Repository))
+	if len(dashboard.Tasks) == 0 {
+		fmt.Fprintln(a.Out, "No blocked or aging tasks.")
+		return
+	}
+	fmt.Fprintln(a.Out, "Needs attention")
+	for _, task := range dashboard.Tasks {
+		fmt.Fprintf(a.Out, "%-18s %-16s %-12s %s\n", task.ID, task.State, task.Reason, task.Objective)
+	}
+}
+
 func (a *App) memoryCommand(ctx context.Context, svc *core.Service, repo string, args []string) int {
 	if len(args) > 0 && args[0] == "set" {
 		if len(args) < 3 {
@@ -719,10 +954,12 @@ func (a *App) help() {
 
 Usage:
   rly [--state PATH]
-  rly [--state PATH] run [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--sandbox MODE] [--json] <objective>
+  rly [--state PATH] run [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--agy-weight N] [--codex-weight N] [--cursor-weight N] [--freebuff-weight N] [--sandbox MODE] [--json] <objective>
   rly [--state PATH] agents [--json]
   rly [--state PATH] status [--json]
   rly [--state PATH] tasks [--json]
+  rly [--state PATH] ops [--aging DURATION] [--json]
+  rly [--state PATH] cancel [--reason TEXT] [--idempotency-key KEY] [--json] <task-id>
   rly [--state PATH] memory [--json]
   rly [--state PATH] memory set <key> <value>
   rly [--state PATH] memory delete <key>
@@ -733,6 +970,19 @@ In the REPL, enter an objective to run it automatically optimized for token
 availability and agent efficacy, or use /help, /status, /tasks, or /exit.
 The phrases "status", "status of task", "tasks", and "show tasks" are also
 recognized as commands.
+
+Run options:
+  --strategy balanced       Blend capability fit, session context, quota
+                            headroom, and reliability. This is the default.
+  --strategy conservative   Prefer token conservation and quota headroom over
+                            small capability-score differences.
+  --strategy quality-first  Prefer maximum capability and efficacy fit.
+  --min-reserve PCT         Keep at least this percentage of measured provider
+                            quota in reserve; auto-routing skips agents below
+                            the threshold unless no higher-headroom agent is
+                            eligible.
+  --max-total-tokens N      Stop before launch when estimated task usage would
+                            exceed this task-level token limit.
 `)
 }
 
