@@ -435,6 +435,15 @@ func TestExecuteUpdatesStageTwoArtifactState(t *testing.T) {
 			Usage     agents.Usage `json:"usage"`
 			Summary   string       `json:"summary"`
 		} `json:"agent_results"`
+		ProviderAttempts []struct {
+			Attempt   int    `json:"attempt"`
+			Role      string `json:"role"`
+			Adapter   string `json:"adapter"`
+			Status    string `json:"status"`
+			Model     string `json:"model"`
+			SessionID string `json:"session_id"`
+			ExitCode  int    `json:"exit_code"`
+		} `json:"provider_attempts"`
 	}
 	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatal(err)
@@ -458,6 +467,13 @@ func TestExecuteUpdatesStageTwoArtifactState(t *testing.T) {
 	result := state.AgentResults[0]
 	if result.Role != "implementer" || result.Adapter != "fake" || result.Status != "COMPLETED" || result.SessionID != "session-1" || result.ExitCode != 0 || result.Usage.TotalTokens != 42 || result.Summary != "finished" {
 		t.Fatalf("agent result = %+v", result)
+	}
+	if len(state.ProviderAttempts) != 1 {
+		t.Fatalf("provider attempts = %+v", state.ProviderAttempts)
+	}
+	attempt := state.ProviderAttempts[0]
+	if attempt.Attempt != 1 || attempt.Role != "implementer" || attempt.Adapter != "fake" || attempt.Status != "COMPLETED" || attempt.SessionID != "session-1" || attempt.ExitCode != 0 {
+		t.Fatalf("provider attempt = %+v", attempt)
 	}
 	events, err := svc.Trace(context.Background(), task.ID)
 	if err != nil {
@@ -532,6 +548,11 @@ func TestFailedExecuteUpdatesRetryAccounting(t *testing.T) {
 			Status string `json:"status"`
 			Error  string `json:"error"`
 		} `json:"agent_results"`
+		ProviderAttempts []struct {
+			Status string         `json:"status"`
+			Error  string         `json:"error"`
+			Detail map[string]any `json:"error_detail"`
+		} `json:"provider_attempts"`
 	}
 	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatal(err)
@@ -544,6 +565,9 @@ func TestFailedExecuteUpdatesRetryAccounting(t *testing.T) {
 	}
 	if len(state.AgentResults) != 1 || state.AgentResults[0].Role != "implementer" || state.AgentResults[0].Status != "FAILED" || state.AgentResults[0].Error != "boom" {
 		t.Fatalf("agent results = %+v", state.AgentResults)
+	}
+	if len(state.ProviderAttempts) != 1 || state.ProviderAttempts[0].Status != "FAILED" || state.ProviderAttempts[0].Error != "boom" || state.ProviderAttempts[0].Detail["cause"] != "boom" {
+		t.Fatalf("provider attempts = %+v", state.ProviderAttempts)
 	}
 }
 

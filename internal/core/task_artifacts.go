@@ -27,6 +27,7 @@ type taskArtifactState struct {
 	Operations               taskOperationalState         `json:"operations"`
 	CompletionGates          []completionGate             `json:"completion_gates"`
 	RetryLimits              map[string]retryLimit        `json:"retry_limits"`
+	ProviderAttempts         []providerAttemptArtifact    `json:"provider_attempts"`
 	AgentResults             []agentResultArtifact        `json:"agent_results"`
 	CreatedAt                time.Time                    `json:"created_at"`
 	UpdatedAt                time.Time                    `json:"updated_at"`
@@ -100,6 +101,21 @@ type agentResultArtifact struct {
 	Data        map[string]any `json:"data,omitempty"`
 }
 
+type providerAttemptArtifact struct {
+	Attempt     int            `json:"attempt"`
+	Role        string         `json:"role"`
+	Adapter     string         `json:"adapter"`
+	Model       string         `json:"model,omitempty"`
+	Status      string         `json:"status"`
+	SessionID   string         `json:"session_id,omitempty"`
+	ExitCode    int            `json:"exit_code"`
+	Error       string         `json:"error,omitempty"`
+	ErrorDetail map[string]any `json:"error_detail,omitempty"`
+	TracePaths  []string       `json:"trace_paths,omitempty"`
+	StartedAt   time.Time      `json:"started_at"`
+	CompletedAt time.Time      `json:"completed_at"`
+}
+
 func newTaskArtifactState(task model.Task) taskArtifactState {
 	now := task.UpdatedAt
 	return taskArtifactState{
@@ -128,9 +144,10 @@ func newTaskArtifactState(task model.Task) taskArtifactState {
 			"verifier":    {MaxAttempts: 2},
 			"reviewer":    {MaxAttempts: 2},
 		},
-		AgentResults: []agentResultArtifact{},
-		CreatedAt:    task.CreatedAt,
-		UpdatedAt:    task.UpdatedAt,
+		ProviderAttempts: []providerAttemptArtifact{},
+		AgentResults:     []agentResultArtifact{},
+		CreatedAt:        task.CreatedAt,
+		UpdatedAt:        task.UpdatedAt,
 	}
 }
 
@@ -168,6 +185,9 @@ func readTaskArtifactState(task model.Task) (taskArtifactState, string, error) {
 	}
 	if state.AgentResults == nil {
 		state.AgentResults = []agentResultArtifact{}
+	}
+	if state.ProviderAttempts == nil {
+		state.ProviderAttempts = []providerAttemptArtifact{}
 	}
 	if state.Orchestration.Backend == "" {
 		state.Orchestration = localOrchestrationDecision()
@@ -208,6 +228,7 @@ func migrateLegacyTaskArtifactState(task model.Task, state taskArtifactState) ta
 		next.Orchestration = state.Orchestration
 	}
 	next.AgentResults = state.AgentResults
+	next.ProviderAttempts = state.ProviderAttempts
 	next.RetryLimits = state.RetryLimits
 	next.CompletionGates = state.CompletionGates
 	next.Operations = state.Operations
@@ -289,6 +310,30 @@ func recordArtifactAgentResult(task model.Task, role, adapter, status string, re
 			state.RetryLimits[role] = limit
 			state.NextRecommendedAction = retryNextAction(role, limit)
 		}
+	})
+}
+
+func recordArtifactProviderAttempt(task model.Task, role, adapter, selectedModel, status string, result agents.Result, started, completed time.Time, errorDetail map[string]any, tracePaths []string) error {
+	return updateTaskArtifactState(task, func(state *taskArtifactState) {
+		item := providerAttemptArtifact{
+			Attempt:     len(state.ProviderAttempts) + 1,
+			Role:        role,
+			Adapter:     adapter,
+			Model:       selectedModel,
+			Status:      status,
+			SessionID:   result.SessionID,
+			ExitCode:    result.ExitCode,
+			Error:       result.Error,
+			ErrorDetail: errorDetail,
+			TracePaths:  tracePaths,
+			StartedAt:   started,
+			CompletedAt: completed,
+		}
+		if result.Err != nil && item.Error == "" {
+			item.Error = result.Err.Error()
+		}
+		state.ProviderAttempts = append(state.ProviderAttempts, item)
+		state.Operations.Observability.LastEventAt = completed
 	})
 }
 

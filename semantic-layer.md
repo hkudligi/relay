@@ -610,7 +610,9 @@ route result is returned:
 After routing, it appends `routing.selected`, including the complete semantic
 profile and candidate summaries. The full event is available through normal
 task trace interfaces, including `rly trace --json <task-id>` and the JSON run
-result.
+result. Execution then records the selected provider/model attempts in the task
+artifact checkpoint, visible with `rly checkpoint <task-id>` or as raw
+`state.json` with `rly checkpoint --json <task-id>`.
 
 If routing finds no eligible agent, `Route` still returns a decision containing
 the profile and excluded candidates along with an error. `Service.Route`
@@ -790,6 +792,13 @@ rly trace --json <task-id> | jq '.[] | select(
   .type == "routing.selected" or
   .type == "orchestration.selected"
 ) | {type, actor, summary, data}'
+```
+
+Use the checkpoint command to inspect the execution-side provider/model attempt
+chain that consumed those routing decisions:
+
+```sh
+rly checkpoint --json <task-id> | jq '.provider_attempts'
 ```
 
 The JSON paths differ between interfaces:

@@ -437,6 +437,9 @@ func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Ada
 	request := agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: selectedModel, Sandbox: agents.SandboxReadOnly}
 	run, err := adapter.Start(ctx, request)
 	if err != nil {
+		completed := s.now().UTC()
+		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
+		_ = recordArtifactProviderAttempt(*task, "planner", adapter.Name(), selectedModel, "FAILED", result, started, completed, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
 		return nil, err
 	}
 	for event := range run.Events() {
@@ -460,6 +463,9 @@ func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Ada
 	status := "COMPLETED"
 	if result.Err != nil {
 		status = "FAILED"
+	}
+	if err := recordArtifactProviderAttempt(*task, "planner", adapter.Name(), selectedModel, status, result, started, completed, errorDetailFromResult(result), tracePathsForResult(adapter.Name(), result)); err != nil {
+		return nil, err
 	}
 	if err := s.store.RecordRun(ctx, model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}, task.Repository); err != nil {
 		return nil, err
@@ -681,6 +687,9 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	}
 	if request.MaxTotalTokens > 0 && estimatePromptUsage(request.Prompt).TotalTokens > request.MaxTotalTokens {
 		err := fmt.Errorf("%w: estimated prompt tokens exceed max_total_tokens", ErrCostLimitExceeded)
+		at := s.now().UTC()
+		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
+		_ = recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, "FAILED", result, started, at, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
 		s.failExecution(ctx, task.ID, adapter.Name(), err)
 		return nil, err
 	}
@@ -691,6 +700,9 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	beforeWorkspace, canCheckWorkspace := workspaceStatus(ctx, task.Repository)
 	run, err := adapter.Start(ctx, request)
 	if err != nil {
+		completed := s.now().UTC()
+		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
+		_ = recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, "FAILED", result, started, completed, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
 		s.failExecution(ctx, task.ID, adapter.Name(), err)
 		return nil, err
 	}
@@ -738,6 +750,9 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 				CreatedAt: s.now().UTC(),
 			})
 		}
+	}
+	if err := recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, status, result, started, completed, errorDetailFromResult(result), tracePathsForResult(adapter.Name(), result)); err != nil {
+		return nil, err
 	}
 	record := model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}
 	if err := s.store.RecordRun(ctx, record, task.Repository); err != nil {
@@ -899,6 +914,9 @@ func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, role, ad
 	if result.Result.Err != nil || result.Error != "" || result.Skipped {
 		status = "FAILED"
 	}
+	if err := recordArtifactProviderAttempt(*task, role, adapter, result.Model, status, result.Result, result.StartedAt, result.CompletedAt, errorDetailFromResult(result.Result), tracePathsForResult(adapter, result.Result)); err != nil {
+		return err
+	}
 	if err := s.store.RecordRun(ctx, model.RunRecord{
 		ID:          newID("run"),
 		TaskID:      task.ID,
@@ -914,6 +932,50 @@ func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, role, ad
 		return err
 	}
 	return recordArtifactAgentResult(*task, role, adapter, status, result.Result, result.StartedAt, result.CompletedAt, map[string]any{"orchestrator_task_id": result.TaskID, "skipped": result.Skipped})
+}
+
+func errorDetailFromResult(result agents.Result) map[string]any {
+	if result.Err == nil && result.Error == "" && result.ExitCode == 0 {
+		return nil
+	}
+	detail := map[string]any{"exit_code": result.ExitCode}
+	if result.Error != "" {
+		detail["message"] = result.Error
+	}
+	if result.Err != nil {
+		detail["type"] = fmt.Sprintf("%T", result.Err)
+		detail["cause"] = result.Err.Error()
+	}
+	if result.SessionID != "" {
+		detail["session_id"] = result.SessionID
+	}
+	return detail
+}
+
+func errorDetailFromError(err error) map[string]any {
+	if err == nil {
+		return nil
+	}
+	return map[string]any{
+		"exit_code": -1,
+		"type":      fmt.Sprintf("%T", err),
+		"cause":     err.Error(),
+	}
+}
+
+func tracePathsForResult(adapter string, result agents.Result) []string {
+	if adapter != "freebuff" || !strings.HasPrefix(result.SessionID, "freebuff:") {
+		return nil
+	}
+	dir := strings.TrimPrefix(result.SessionID, "freebuff:")
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(dir, "status.md"),
+		filepath.Join(dir, "result.md"),
+		filepath.Join(dir, "trace.log"),
+	}
 }
 
 func (s *Service) recordOrchestrationDecision(ctx context.Context, task model.Task, decision DurableOrchestrationDecision) error {

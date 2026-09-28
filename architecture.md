@@ -63,8 +63,8 @@ Responsibilities:
 - Provide the interactive repository-aware REPL.
 - Discover installed agents and available models.
 - Start runs and render normalized progress.
-- Expose task, project, trace, memory, operations, cancellation, and resume
-  commands.
+- Expose task, project, trace, checkpoint, memory, operations, cancellation,
+  and resume commands.
 - Keep machine-readable `--json` output separate from human-readable output.
 
 The current user-facing commands include:
@@ -76,6 +76,7 @@ rly project <project-id>
 rly resume <task-id>
 rly tasks
 rly trace <task-id>
+rly checkpoint <task-id>
 rly status
 rly ops
 rly cancel <task-id>
@@ -103,9 +104,9 @@ CREATE PROJECT/TASK
         +--> BLOCKED / WAITING_FOR_USER
 ```
 
-Every task has an append-only event trace. Agent runs, routing decisions,
-session identifiers, failures, memory updates, and lifecycle transitions are
-recorded as durable state.
+Every task has an append-only event trace. Agent runs, provider/model attempts,
+routing decisions, session identifiers, failures, memory updates, and lifecycle
+transitions are recorded as durable state.
 
 ### Projects
 
@@ -265,11 +266,19 @@ operational metadata for:
 - Cancellation and idempotency.
 - Access control.
 - Orchestration backend metadata.
+- Provider/model attempt history, including selected model, session ID, exit
+  code, structured error detail, and relevant Freebuff status/result/trace
+  paths when available.
 - Agent result history.
 
 These artifacts complement SQLite: SQLite is optimized for coordination and
 queries, while artifacts are inspectable handoff material for humans and
 future agent contexts.
+
+`rly checkpoint <task-id>` renders the current artifact state for humans,
+including the latest checkpoint, retry chain, provider attempts, Freebuff run
+directory hints, and latest result summary. `rly checkpoint --json <task-id>`
+returns the raw `state.json` artifact for automation.
 
 ## Execution flows
 
@@ -284,7 +293,7 @@ CLI objective
   -> compose prompt with project memory
   -> start adapter
   -> normalize streamed events
-  -> record run/session/trace
+  -> record provider attempt, run/session/trace, and artifact checkpoint
   -> validate completion
   -> complete, fail, or retry
 ```

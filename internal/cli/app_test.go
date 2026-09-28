@@ -297,6 +297,54 @@ func TestRunJSONIncludesInventoryAndTrace(t *testing.T) {
 	}
 }
 
+func TestCheckpointCommandShowsArtifactState(t *testing.T) {
+	app, out, errOut, dbPath := testApp(t)
+	adapter := &replAdapter{available: true}
+	app.Adapters["codex"] = adapter
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "run", "--json", "implement", "checkpoint"}); code != cli.ExitOK {
+		t.Fatalf("run exit = %d, stderr = %s", code, errOut.String())
+	}
+	var result struct {
+		Execution *core.Execution `json:"execution"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Execution == nil {
+		t.Fatalf("run result = %+v", result)
+	}
+	taskID := result.Execution.Task.ID
+
+	out.Reset()
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "checkpoint", taskID}); code != cli.ExitOK {
+		t.Fatalf("checkpoint exit = %d, stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"checkpoint: completed", "retry chain:", "provider attempts:", "COMPLETED implementer/codex", "latest result: COMPLETED implementer/codex"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("checkpoint output missing %q:\n%s", want, got)
+		}
+	}
+
+	out.Reset()
+	if code := app.Run(context.Background(), []string{"--state", dbPath, "checkpoint", "--json", taskID}); code != cli.ExitOK {
+		t.Fatalf("checkpoint json exit = %d, stderr = %s", code, errOut.String())
+	}
+	var checkpoint struct {
+		Status           model.TaskState `json:"status"`
+		ProviderAttempts []struct {
+			Adapter string `json:"adapter"`
+			Model   string `json:"model"`
+		} `json:"provider_attempts"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if checkpoint.Status != model.TaskCompleted || len(checkpoint.ProviderAttempts) != 1 || checkpoint.ProviderAttempts[0].Adapter != "codex" || checkpoint.ProviderAttempts[0].Model != "test-model" {
+		t.Fatalf("checkpoint json = %+v", checkpoint)
+	}
+}
+
 func TestAgentsJSONIncludesQuotaProvenance(t *testing.T) {
 	app, out, errOut, dbPath := testApp(t)
 	app.Adapters["codex"] = &replAdapter{available: true}
@@ -342,6 +390,7 @@ func TestHelpDocumentsRoutingStrategyAndReserveOptions(t *testing.T) {
 		"--max-total-tokens N",
 		"rly [--state PATH] ops",
 		"rly [--state PATH] cancel",
+		"rly [--state PATH] checkpoint",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help missing %q:\n%s", want, got)

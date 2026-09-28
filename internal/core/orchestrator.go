@@ -41,6 +41,7 @@ type AgentTask struct {
 type AgentTaskResult struct {
 	TaskID      string        `json:"task_id"`
 	Agent       string        `json:"agent"`
+	Model       string        `json:"model,omitempty"`
 	Result      agents.Result `json:"result"`
 	PromptUsage agents.Usage  `json:"prompt_usage,omitempty"`
 	StartedAt   time.Time     `json:"started_at"`
@@ -307,7 +308,7 @@ func (o Orchestrator) runBatch(ctx context.Context, tasks []AgentTask) ([]AgentT
 		go func(index int, task AgentTask) {
 			defer wg.Done()
 			started := time.Now().UTC()
-			result := AgentTaskResult{TaskID: task.ID, Agent: task.Agent, PromptUsage: estimatePromptUsage(task.Request.Prompt), StartedAt: started}
+			result := AgentTaskResult{TaskID: task.ID, Agent: task.Agent, Model: task.Request.Model, PromptUsage: estimatePromptUsage(task.Request.Prompt), StartedAt: started}
 			run, err := o.Adapters[task.Agent].Start(batchCtx, task.Request)
 			if err != nil {
 				result.Error = err.Error()
