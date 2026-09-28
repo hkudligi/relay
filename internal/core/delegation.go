@@ -47,15 +47,15 @@ block when no delegation is needed.`
 }
 
 func parseDelegatedTasks(response string) ([]DelegatedTask, error) {
-	start := strings.LastIndex(response, delegationOpen)
+	end := strings.LastIndex(response, delegationClose)
+	if end < 0 {
+		return nil, nil
+	}
+	start := strings.LastIndex(response[:end], delegationOpen)
 	if start < 0 {
 		return nil, nil
 	}
-	relEnd := strings.Index(response[start+len(delegationOpen):], delegationClose)
-	if relEnd < 0 {
-		return nil, fmt.Errorf("unterminated %s block", delegationOpen)
-	}
-	body := strings.TrimSpace(response[start+len(delegationOpen) : start+len(delegationOpen)+relEnd])
+	body := strings.TrimSpace(response[start+len(delegationOpen) : end])
 	var tasks []DelegatedTask
 	decoder := json.NewDecoder(strings.NewReader(body))
 	decoder.DisallowUnknownFields()
