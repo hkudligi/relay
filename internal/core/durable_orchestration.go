@@ -1,5 +1,7 @@
 package core
 
+import "github.com/harsha/relay/internal/model"
+
 // DurableOrchestrationBackend identifies the execution engine that should own
 // a task graph's lifecycle.
 type DurableOrchestrationBackend string
@@ -67,6 +69,28 @@ func AssessDurableOrchestration(tasks []AgentTask, hints DurableOrchestrationHin
 
 func localOrchestrationDecision() DurableOrchestrationDecision {
 	return AssessDurableOrchestration(nil, DurableOrchestrationHints{})
+}
+
+func semanticDurableHints(profile model.SemanticProfile) DurableOrchestrationHints {
+	hints := DurableOrchestrationHints{}
+	if profile.LongRunning {
+		hints.ProcessIndependentRetries = true
+		hints.ReliableWorkerRecovery = true
+	}
+	for _, signal := range profile.Signals {
+		switch signal {
+		case "blocked":
+			hints.WaitingForUser = true
+		case "quota-pressure":
+			hints.ProcessIndependentRetries = true
+		}
+	}
+	for _, operation := range profile.Operations {
+		if operation == "monitor" || operation == "orchestrate" {
+			hints.ReliableWorkerRecovery = hints.ReliableWorkerRecovery || profile.LongRunning
+		}
+	}
+	return hints
 }
 
 func hasParallelBranches(tasks []AgentTask) bool {

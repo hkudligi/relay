@@ -47,3 +47,24 @@ func TestStartProcessStopsAfterBlankAgentError(t *testing.T) {
 		t.Fatalf("blank terminal error took %s; child was not stopped promptly", elapsed)
 	}
 }
+
+func TestStartProcessIncludesStderrWithBlankAgentError(t *testing.T) {
+	run, err := StartProcess(context.Background(), "sh", []string{"-c", `printf '%s\n' 'provider connection failed' >&2; printf '%s\n' error; sleep 5`}, t.TempDir(), func(line []byte) (Event, bool, error) {
+		if strings.TrimSpace(string(line)) == "error" {
+			return Event{Kind: EventError}, true, nil
+		}
+		return Event{}, false, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := run.Wait()
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "provider connection failed") {
+		t.Fatalf("result error = %v, want provider stderr", result.Err)
+	}
+
+	event := <-run.Events()
+	if event.Message == "agent reported an error" || !strings.Contains(event.Message, "provider connection failed") {
+		t.Fatalf("error event = %q, want provider stderr", event.Message)
+	}
+}

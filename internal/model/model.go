@@ -4,6 +4,14 @@ import "time"
 
 type TaskState string
 
+type ProjectState string
+
+const (
+	ProjectActive   ProjectState = "ACTIVE"
+	ProjectPaused   ProjectState = "PAUSED"
+	ProjectArchived ProjectState = "ARCHIVED"
+)
+
 const (
 	TaskCreated        TaskState = "CREATED"
 	TaskPlanning       TaskState = "PLANNING"
@@ -19,12 +27,27 @@ const (
 
 type Task struct {
 	ID         string    `json:"id"`
+	ProjectID  string    `json:"project_id,omitempty"`
 	Repository string    `json:"repository"`
 	Objective  string    `json:"objective"`
 	State      TaskState `json:"state"`
 	Version    int64     `json:"version"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// Project is the durable history and retry scope for a repository. Tasks are
+// attempts or milestones inside a project; a project survives individual task
+// failures and agent-session replacement.
+type Project struct {
+	ID           string       `json:"id"`
+	Name         string       `json:"name"`
+	Repository   string       `json:"repository"`
+	State        ProjectState `json:"state"`
+	ActiveTaskID string       `json:"active_task_id,omitempty"`
+	TaskCount    int          `json:"task_count"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
 }
 
 type Event struct {
@@ -97,11 +120,29 @@ type CandidateScore struct {
 	Details          map[string]any `json:"details,omitempty"`
 }
 
+// SemanticProfile is the coordinator's compact understanding of a task. It is
+// deliberately provider-neutral so it can be produced by deterministic rules,
+// embeddings, a local classifier, or a small controller model.
+type SemanticProfile struct {
+	Backend              string   `json:"backend,omitempty"`
+	TaskKind             string   `json:"task_kind"`
+	Domains              []string `json:"domains,omitempty"`
+	Operations           []string `json:"operations,omitempty"`
+	Risks                []string `json:"risks,omitempty"`
+	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+	Signals              []string `json:"signals,omitempty"`
+	Mutation             bool     `json:"mutation"`
+	LongRunning          bool     `json:"long_running"`
+	NeedsReview          bool     `json:"needs_review"`
+	Confidence           float64  `json:"confidence"`
+}
+
 // RouteDecision is the explainable decision produced by the coordinator router
 // selecting the best agent for a task role based on token availability and efficacy.
 type RouteDecision struct {
 	Role            string           `json:"role"`
 	Objective       string           `json:"objective"`
+	SemanticProfile *SemanticProfile `json:"semantic_profile,omitempty"`
 	SelectedAgent   string           `json:"selected_agent"`
 	SelectedModel   string           `json:"selected_model,omitempty"`
 	Rationale       string           `json:"rationale"`

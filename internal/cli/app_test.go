@@ -221,7 +221,7 @@ func TestREPLExecutesObjectiveWithDefaultCodexAdapter(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if got := out.String(); !strings.Contains(got, "Model availability") || !strings.Contains(got, "test-model") || !strings.Contains(got, "75%") || !strings.Contains(got, "PLANNING → implementer codex") || !strings.Contains(got, "streamed response") || !strings.Contains(got, "✓ COMPLETED (repl-session)") {
+	if got := out.String(); !strings.Contains(got, "models  codex/test-model 75% ready") || !strings.Contains(got, "exec    codex (test-model)") || !strings.Contains(got, "executor streamed response") || !strings.Contains(got, "done    COMPLETED (repl-session)") {
 		t.Fatalf("output = %q", got)
 	}
 	if adapter.request.Workspace == "" || adapter.request.Sandbox != agents.SandboxWorkspaceWrite || !strings.HasPrefix(adapter.request.Prompt, "implement the feature") {
@@ -261,7 +261,7 @@ func TestREPLExecutesObjectiveWithDefaultCodexAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 8 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "routing.selected" || events[4].Summary != "implementer → codex" || events[5].Type != "orchestration.selected" || events[7].Type != "task.state_changed" {
+	if len(events) != 9 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "semantic.assessed" || events[4].Type != "routing.selected" || events[5].Summary != "implementer → codex" || events[6].Type != "orchestration.selected" || events[8].Type != "task.state_changed" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -360,7 +360,7 @@ func TestRunPreservesCodexPlannerAndAgyExecutor(t *testing.T) {
 	if !strings.Contains(executor.request.Prompt, "Inter-agent context") || !strings.Contains(executor.request.Prompt, "[plan via planner]") || !strings.Contains(executor.request.Prompt, "streamed response") {
 		t.Fatalf("executor prompt = %q", executor.request.Prompt)
 	}
-	if !strings.Contains(out.String(), "router: planner codex model=test-model") || !strings.Contains(out.String(), "router: implementer agy model=test-model") || !strings.Contains(out.String(), "PLANNING → planner codex (test-model) → implementer agy (test-model)") {
+	if !strings.Contains(out.String(), "plan    codex (test-model)") || !strings.Contains(out.String(), "exec    agy (test-model)") || !strings.Contains(out.String(), "planner streamed response") || !strings.Contains(out.String(), "executor streamed response") {
 		t.Fatalf("output = %q", out.String())
 	}
 }
@@ -372,7 +372,7 @@ func TestRunPrintsNormalizedProgressUpdates(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath, "run", "inspect", "it"}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "[executor codex model=test-model] progress: tool_call state=running") {
+	if !strings.Contains(out.String(), "executor tool_call (running)") {
 		t.Fatalf("output = %q", out.String())
 	}
 }
@@ -556,7 +556,7 @@ func TestREPLPrefersAgyOverCodex(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "executor=agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
+	if !strings.Contains(out.String(), "exec    agy (test-model)") || !strings.Contains(out.String(), "done    COMPLETED") {
 		t.Fatalf("stdout = %q", out.String())
 	}
 }
@@ -572,7 +572,7 @@ func TestREPLPrefersAgyOverFreebuff(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"--state", dbPath}); code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "executor=agy") || !strings.Contains(out.String(), "✓ COMPLETED") {
+	if !strings.Contains(out.String(), "exec    agy (test-model)") || !strings.Contains(out.String(), "done    COMPLETED") {
 		t.Fatalf("stdout = %q", out.String())
 	}
 }
@@ -618,7 +618,7 @@ func TestRunAutoRoutesToBestAgentBasedOnTokensAndEfficacy(t *testing.T) {
 	if code != cli.ExitOK {
 		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "router: implementer") || !strings.Contains(out.String(), "PLANNING → implementer") {
+	if !strings.Contains(out.String(), "exec    agy (test-model)") || !strings.Contains(out.String(), "rly run") {
 		t.Fatalf("output = %q", out.String())
 	}
 }

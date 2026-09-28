@@ -30,6 +30,9 @@ Useful commands:
 ./rly agents --json
 ./rly status
 ./rly tasks
+./rly projects
+./rly project <project-id>
+./rly resume <task-id>
 ./rly ops
 ./rly cancel <task-id>
 ./rly memory
@@ -39,11 +42,27 @@ Useful commands:
 ./rly status --json
 ```
 
+Implementation details for task classification, routing effects, lexical
+matching, orchestration hints, examples, and current limitations are in
+[`semantic-layer.md`](semantic-layer.md).
+
 State is stored in `~/.rly/state.db` by default. Use `--state PATH` before the
 subcommand to select another database.
 
-Human-readable `rly run` commands execute supported agents headlessly and stream
-their progress through `rly`; runs do not open additional Terminal tabs.
+## Projects and resumable history
+
+Every task is assigned to a durable project for its repository. A project is
+the long-lived scope around a sequence of task attempts: failed, cancelled,
+and completed tasks remain visible together, while agent sessions remain tied
+to the individual attempt that produced them.
+
+`rly resume <task-id>` creates a new task attempt in the same project,
+preserving the prior task and its trace as history. Use `rly run --project
+<project-id> "..."` to append a deliberate follow-up attempt to a project.
+
+Human-readable `rly run` commands execute supported agents headlessly and render
+a compact live status view through `rly`; runs do not open additional Terminal
+tabs. `--json` keeps the machine-readable output unchanged.
 
 ## Conversational REPL
 
@@ -57,14 +76,15 @@ rly
 repo: relay
 
 › fix the flaky cache test
-Agent/model inventory:
-  codex    gpt-5.6-sol              installed=yes usable=yes remaining=UNKNOWN confidence=UNKNOWN version=0.x source=codex app-server account/rateLimits/read
-task-...  PLANNING → codex
-...streamed Codex response...
-✓ COMPLETED (session-id)
+rly run task-...  PLANNING
+models  codex/gpt-5.6-sol UNKNOWN ready
+exec    codex (gpt-5.6-sol)
+executor codex (gpt-5.6-sol) running
+executor ...streamed Codex response...
+done    COMPLETED (session-id)
 ```
 
-REPL executions stream agent messages as they arrive and persist the same task
+REPL executions show the same compact status surface and persist the same task
 state, run result, upstream session, project-memory updates, and trace events as
 `rly run`. An unavailable Codex installation or a failed run is reported on
 standard error; the REPL stays open so status can be inspected or another task
@@ -191,6 +211,11 @@ vendor-neutral.
   - `conservative`: Prioritizes token conservation and headroom over minor capability differences.
   - `quality-first`: Prioritizes maximum capability and efficacy fit.
 - **Trace observability**: Every routing decision, rationale, and candidate score breakdown is recorded as a `routing.selected` trace event and exposed via `rly trace --json` and `rly run --json`.
+
+Routing decisions also include a provider-neutral semantic profile for the task,
+with task kind, domains, operations, risks, required capabilities, and review
+signals. See [semantic-layer.md](semantic-layer.md) for the semantic routing and
+monitoring blueprint.
 
 See [rly-product-technical-spec.md](rly-product-technical-spec.md) for the full
 product and technical specification.

@@ -118,6 +118,7 @@ func collectProcess(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Reader
 
 	result := Result{ExitCode: -1}
 	sawResult := false
+	var pendingError *Event
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
@@ -133,16 +134,16 @@ func collectProcess(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Reader
 			continue
 		}
 		event.Time = time.Now().UTC()
-		if event.Kind == EventError && strings.TrimSpace(event.Message) == "" {
-			event.Message = "agent reported an error"
-		}
 		sawResult = applyEvent(&result, event) || sawResult
 		if event.Kind == EventError {
 			// Provider failures such as quota exhaustion are terminal. Some
 			// CLIs (notably agy) report the failure but keep their language
 			// server/session alive, so waiting for normal process exit can add
 			// a large and needless delay.
-			sendEvent(ctx, events, event)
+			if strings.TrimSpace(event.Message) == "" {
+				result.Err = errors.New("agent reported an error")
+			}
+			pendingError = &event
 			_ = cmd.Process.Kill()
 			break
 		}
@@ -174,6 +175,13 @@ func collectProcess(ctx context.Context, cmd *exec.Cmd, stdout, stderr io.Reader
 	}
 	if result.Err != nil {
 		result.Error = result.Err.Error()
+	}
+	if pendingError != nil {
+		pendingError.Message = result.Error
+		if pendingError.Message == "" {
+			pendingError.Message = "agent reported an error"
+		}
+		_ = sendEvent(ctx, events, *pendingError)
 	}
 	done <- result
 }
@@ -519,7 +527,10 @@ func readTerminalEvents(ctx context.Context, paths terminalLifecyclePaths, norma
 			event.Time = time.Now().UTC()
 			_ = appendTerminalDisplay(paths.display, formatTerminalEvent(event))
 			sawResult = applyEvent(&result, event) || sawResult
-			if event.Kind == EventError && event.Message != "" {
+			if event.Kind == EventError {
+				if strings.TrimSpace(event.Message) == "" {
+					event.Message = withTerminalStderr(errors.New("agent reported an error"), paths.stderr).Error()
+				}
 				sendEvent(ctx, events, event)
 				return result, sawResult, offset, false, nil
 			}

@@ -28,7 +28,8 @@ import (
 // rly embeds the channel directory and this protocol into the task brief,
 // pastes one short pointer at prompt.md into the TUI, tails status.md for
 // streamed progress, and treats result.md as the terminal answer. The channel
-// directory is unique per run so concurrent freebuff tasks never collide.
+// directory is unique per run; the adapter's user-scoped session lock prevents
+// concurrent Freebuff sessions from running against the single account.
 const (
 	promptFileName   = "prompt.md"
 	handoffFileName  = "handoff.md"

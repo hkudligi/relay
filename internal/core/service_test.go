@@ -103,6 +103,34 @@ func TestStartTaskPersistsLifecycle(t *testing.T) {
 	}
 }
 
+func TestTasksShareDurableProjectHistory(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	svc := core.New(db)
+	repo := t.TempDir()
+	first, err := svc.StartTask(context.Background(), repo, "first attempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.StartTask(context.Background(), repo, "retry attempt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ProjectID == "" || second.ProjectID != first.ProjectID {
+		t.Fatalf("project IDs = %q and %q, want one durable project", first.ProjectID, second.ProjectID)
+	}
+	project, tasks, err := svc.Project(context.Background(), first.ProjectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.TaskCount != 2 || len(tasks) != 2 {
+		t.Fatalf("project history = project=%+v tasks=%d, want two tasks", project, len(tasks))
+	}
+}
+
 func TestStartTaskWithInventoryRecordsDiscoveryBeforePlanning(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

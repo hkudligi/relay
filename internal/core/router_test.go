@@ -343,14 +343,26 @@ func TestServiceRouteRecordsTraceEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawRoutingEvent bool
+	var sawRoutingEvent, sawSemanticEvent bool
 	for _, e := range events {
+		if e.Type == "semantic.assessed" && e.Actor == "semantic" {
+			sawSemanticEvent = true
+			if e.Data["profile"] == nil {
+				t.Fatalf("semantic event data = %+v", e.Data)
+			}
+		}
 		if e.Type == "routing.selected" && e.Actor == "router" {
 			sawRoutingEvent = true
 			if e.Data["selected_agent"] != "codex" {
 				t.Fatalf("event data = %+v", e.Data)
 			}
+			if e.Data["semantic"] == nil {
+				t.Fatalf("routing event missing semantic profile: %+v", e.Data)
+			}
 		}
+	}
+	if !sawSemanticEvent {
+		t.Fatalf("expected semantic.assessed event in trace, got: %+v", events)
 	}
 	if !sawRoutingEvent {
 		t.Fatalf("expected routing.selected event in trace, got: %+v", events)

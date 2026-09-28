@@ -43,6 +43,10 @@ var (
 	errSessionDead   = errors.New("freebuff TUI exited before accepting the task")
 	errReadinessGone = errors.New("freebuff TUI exited before becoming ready")
 	errSessionEnded  = errors.New("freebuff session ended before writing result.md")
+	// ErrSessionConflict means another Freebuff CLI already owns the account
+	// session. Taking it over would interrupt the other run, so callers should
+	// surface this error instead of retrying another provider automatically.
+	ErrSessionConflict = errors.New("freebuff already has an active account session")
 )
 
 // startTUI launches the CLI inside a PTY without seeding a prompt: the
@@ -227,7 +231,11 @@ func (s *tuiSession) watch() {
 				output.Reset()
 				output.WriteString(trimmed[len(trimmed)-16*1024:])
 			}
-			if strings.Contains(output.String(), "Unhandled rejection") || strings.Contains(output.String(), "EPERM:") || strings.Contains(output.String(), "EACCES:") || strings.Contains(output.String(), "Another freebuff instance") || strings.Contains(output.String(), "Only one CLI per account") {
+			if strings.Contains(output.String(), "Another freebuff instance") || strings.Contains(output.String(), "Only one CLI per account") {
+				s.signalFatal(fmt.Errorf("%w: %s", ErrSessionConflict, s.diagnostic()))
+				return
+			}
+			if strings.Contains(output.String(), "Unhandled rejection") || strings.Contains(output.String(), "EPERM:") || strings.Contains(output.String(), "EACCES:") {
 				s.signalFatal(fmt.Errorf("freebuff failed during startup: %s", s.diagnostic()))
 				return
 			}
@@ -240,10 +248,10 @@ func (s *tuiSession) watch() {
 			}
 			dialogSeen := strings.Contains(output.String(), "Take over")
 			if dialogSeen && !dialogDismissed {
-				// The dialog focuses "Take over" first. Select it so an
-				// existing stale/session-owned TUI cannot block automation.
-				_ = s.sendKeys("\r")
-				dialogDismissed = true
+				// Never take over an active account session: Freebuff permits only
+				// one CLI session, and doing so would interrupt another rly task.
+				s.signalFatal(fmt.Errorf("%w: takeover dialog detected", ErrSessionConflict))
+				return
 			}
 			// dialogSeen is intentionally based on the accumulated transcript,
 			// so split reads are handled. Once dismissed, its old text must not

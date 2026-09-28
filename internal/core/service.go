@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -93,22 +94,48 @@ func (s *Service) CleanupOldRunsWithRetention(ctx context.Context, retention tim
 }
 
 func (s *Service) StartTask(ctx context.Context, repo, objective string) (*model.Task, error) {
-	return s.startTask(ctx, repo, objective, nil, false)
+	return s.startTask(ctx, "", repo, objective, nil, false)
 }
 
 // StartTaskWithInventory persists discovery between task creation and the
 // transition into planning, making it the first pre-planning task operation.
 func (s *Service) StartTaskWithInventory(ctx context.Context, repo, objective string, inventory []agents.ModelAvailability) (*model.Task, error) {
-	return s.startTask(ctx, repo, objective, inventory, true)
+	return s.startTask(ctx, "", repo, objective, inventory, true)
 }
 
-func (s *Service) startTask(ctx context.Context, repo, objective string, inventory []agents.ModelAvailability, recordInventory bool) (*model.Task, error) {
+func (s *Service) StartTaskWithInventoryForProject(ctx context.Context, projectID, repo, objective string, inventory []agents.ModelAvailability) (*model.Task, error) {
+	return s.startTask(ctx, projectID, repo, objective, inventory, true)
+}
+
+func (s *Service) startTask(ctx context.Context, projectID, repo, objective string, inventory []agents.ModelAvailability, recordInventory bool) (*model.Task, error) {
 	now := s.now().UTC()
+	var project *model.Project
+	var err error
+	if projectID != "" {
+		project, err = s.store.Project(ctx, projectID)
+		if err == nil && project.Repository != repo {
+			return nil, fmt.Errorf("project %s belongs to %s, not %s", projectID, project.Repository, repo)
+		}
+	} else {
+		project, err = s.store.ProjectByRepository(ctx, repo)
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		project, err = s.store.EnsureProject(ctx, model.Project{ID: newID("project"), Name: filepath.Base(repo), Repository: repo, State: model.ProjectActive, CreatedAt: now, UpdatedAt: now})
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ensure project: %w", err)
+	}
+	if err := s.store.AssignUnprojectedTasks(ctx, repo, project.ID); err != nil {
+		return nil, fmt.Errorf("assign existing tasks to project: %w", err)
+	}
 	id := newID("task")
-	t := model.Task{ID: id, Repository: repo, Objective: objective, State: model.TaskCreated, Version: 1, CreatedAt: now, UpdatedAt: now}
+	t := model.Task{ID: id, ProjectID: project.ID, Repository: repo, Objective: objective, State: model.TaskCreated, Version: 1, CreatedAt: now, UpdatedAt: now}
 	e := model.Event{ID: newID("evt"), TaskID: id, Sequence: 1, Type: "task.created", Actor: "user", Summary: objective, CreatedAt: now}
 	if err := s.store.CreateTask(ctx, t, e); err != nil {
 		return nil, err
+	}
+	if err := s.store.SetProjectActiveTask(ctx, project.ID, id, now); err != nil {
+		return nil, fmt.Errorf("set project active task: %w", err)
 	}
 	if recordInventory {
 		now = s.now().UTC()
@@ -174,6 +201,22 @@ func (s *Service) Status(ctx context.Context, repo string) (model.Status, error)
 }
 func (s *Service) Tasks(ctx context.Context, repo string) ([]model.Task, error) {
 	return s.store.ListTasks(ctx, repo, 20)
+}
+
+func (s *Service) Projects(ctx context.Context) ([]model.Project, error) {
+	return s.store.ListProjects(ctx, 100)
+}
+
+func (s *Service) Project(ctx context.Context, id string) (*model.Project, []model.Task, error) {
+	project, err := s.store.Project(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	tasks, err := s.store.ListTasksByProject(ctx, id, 100)
+	if err != nil {
+		return nil, nil, err
+	}
+	return project, tasks, nil
 }
 func (s *Service) Operations(ctx context.Context, repo string, agingThreshold time.Duration) (OperationalDashboard, error) {
 	if agingThreshold <= 0 {
@@ -317,6 +360,20 @@ func (s *Service) Route(ctx context.Context, taskID, role, objective string, ada
 		}
 	}
 	decision, err := Route(ctx, role, objective, adapters, inventory, existingSessionAgent, policy)
+	if taskID != "" && decision != nil && decision.SemanticProfile != nil {
+		now := s.now().UTC()
+		_ = s.store.AppendEvent(ctx, model.Event{
+			ID:      newID("evt"),
+			TaskID:  taskID,
+			Type:    "semantic.assessed",
+			Actor:   "semantic",
+			Summary: fmt.Sprintf("semantic profile: %s %.2f", decision.SemanticProfile.TaskKind, decision.SemanticProfile.Confidence),
+			Data: map[string]any{
+				"profile": decision.SemanticProfile,
+			},
+			CreatedAt: now,
+		})
+	}
 	if err != nil {
 		return decision, err
 	}
@@ -348,6 +405,7 @@ func (s *Service) Route(ctx context.Context, taskID, role, objective string, ada
 				"selected_agent": decision.SelectedAgent,
 				"rationale":      decision.Rationale,
 				"strategy":       decision.Strategy,
+				"semantic":       decision.SemanticProfile,
 				"candidates":     candidateData,
 			},
 			CreatedAt: now,
@@ -383,7 +441,7 @@ func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Ada
 	}
 	for event := range run.Events() {
 		if emit != nil {
-			if event.Kind == agents.EventMessage {
+			if agentTextEvent(event.Kind) {
 				event.Message, _ = parseMemoryUpdate(event.Message)
 			}
 			emit(event)
@@ -478,7 +536,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 		{ID: "plan", Agent: "planner", Request: agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: plannerModel, Sandbox: agents.SandboxReadOnly}, ReadOnly: true},
 		{ID: "execute", Agent: "executor", Request: request, DependsOn: []string{"plan"}, ReadOnly: false},
 	}
-	decision := AssessDurableOrchestration(agentTasks, DurableOrchestrationHints{})
+	decision := AssessDurableOrchestration(agentTasks, semanticDurableHints(AnalyzeObjective(RoleImplementation, task.Objective)))
 	if err := s.recordOrchestrationDecision(ctx, *task, decision); err != nil {
 		return nil, err
 	}
@@ -491,7 +549,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 		TokenBudget: TokenBudget{MaxTotalTokens: request.MaxTotalTokens},
 		OnEvent: func(agentTask AgentTask, event agents.Event) {
 			if agentTask.ID == "plan" {
-				if event.Kind == agents.EventMessage {
+				if agentTextEvent(event.Kind) {
 					event.Message, _ = parseMemoryUpdate(event.Message)
 				}
 				if emitPlan != nil {
@@ -505,7 +563,7 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 				}
 				return
 			}
-			if event.Kind == agents.EventMessage {
+			if agentTextEvent(event.Kind) {
 				event.Message, _ = parseMemoryUpdate(event.Message)
 			}
 			if emitExecution != nil {
@@ -638,7 +696,7 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	}
 	for event := range run.Events() {
 		if emit != nil {
-			if event.Kind == agents.EventMessage {
+			if agentTextEvent(event.Kind) {
 				event.Message, _ = parseMemoryUpdate(event.Message)
 			}
 			emit(event)
@@ -653,7 +711,11 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	result := run.Wait()
 	if result.Err == nil && canCheckWorkspace && request.Sandbox == agents.SandboxWorkspaceWrite {
 		afterWorkspace, afterOK := workspaceStatus(ctx, task.Repository)
-		if afterOK && afterWorkspace == beforeWorkspace {
+		semanticProfile := AnalyzeObjective(RoleImplementation, task.Objective)
+		// A read-only explanation or documentation response can complete without
+		// a filesystem diff. Mutation-oriented objectives still require evidence
+		// that the repository changed.
+		if afterOK && afterWorkspace == beforeWorkspace && (semanticProfile.Mutation || strings.TrimSpace(result.Response) == "") {
 			result.Err = fmt.Errorf("%w: agent exited successfully without changing the repository", ErrTaskIncomplete)
 		}
 	}
@@ -795,6 +857,10 @@ func parseMemoryUpdate(response string) (string, model.MemoryUpdate) {
 	return clean, update
 }
 
+func agentTextEvent(kind agents.EventKind) bool {
+	return kind == agents.EventMessage || kind == agents.EventResult
+}
+
 func validMemoryEntry(key, value string) (model.MemoryEntry, error) {
 	key, value = strings.TrimSpace(key), strings.TrimSpace(value)
 	if err := validMemoryKey(key); err != nil {
@@ -893,7 +959,7 @@ func (r sanitizedPlannerRun) Events() <-chan agents.Event {
 	go func() {
 		defer close(out)
 		for event := range in {
-			if event.Kind == agents.EventMessage {
+			if agentTextEvent(event.Kind) {
 				event.Message, _ = parseMemoryUpdate(event.Message)
 			}
 			out <- event

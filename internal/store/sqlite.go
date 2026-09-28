@@ -53,8 +53,19 @@ CREATE TABLE IF NOT EXISTS repositories (
   path TEXT PRIMARY KEY,
   last_seen_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  repository TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL,
+  active_task_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS projects_updated ON projects(updated_at DESC);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
+  project_id TEXT,
   repository TEXT NOT NULL,
   objective TEXT NOT NULL,
   state TEXT NOT NULL,
@@ -112,7 +123,113 @@ CREATE INDEX IF NOT EXISTS project_memory_repo_updated ON project_memory(reposit
 	if err != nil {
 		return fmt.Errorf("migrate state: %w", err)
 	}
+	if err := s.ensureColumn(ctx, "tasks", "project_id", "TEXT"); err != nil {
+		return fmt.Errorf("migrate task project column: %w", err)
+	}
 	return nil
+}
+
+func (s *SQLite) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var cid int
+	var name, kind string
+	var notNull, pk int
+	var defaultValue any
+	for rows.Next() {
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition)
+	return err
+}
+
+func (s *SQLite) EnsureProject(ctx context.Context, project model.Project) (*model.Project, error) {
+	if project.ID == "" || project.Repository == "" || project.Name == "" {
+		return nil, fmt.Errorf("project id, name, and repository are required")
+	}
+	if project.State == "" {
+		project.State = model.ProjectActive
+	}
+	if project.CreatedAt.IsZero() {
+		project.CreatedAt = time.Now().UTC()
+	}
+	if project.UpdatedAt.IsZero() {
+		project.UpdatedAt = project.CreatedAt
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO projects(id,name,repository,state,active_task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(repository) DO UPDATE SET name=excluded.name,updated_at=excluded.updated_at`, project.ID, project.Name, project.Repository, project.State, project.ActiveTaskID, stamp(project.CreatedAt), stamp(project.UpdatedAt))
+	if err != nil {
+		return nil, err
+	}
+	return s.ProjectByRepository(ctx, project.Repository)
+}
+
+func (s *SQLite) Project(ctx context.Context, id string) (*model.Project, error) {
+	return scanProject(s.db.QueryRowContext(ctx, `SELECT p.id,p.name,p.repository,p.state,p.active_task_id,p.created_at,p.updated_at,COUNT(t.id) FROM projects p LEFT JOIN tasks t ON t.project_id=p.id WHERE p.id=? GROUP BY p.id`, id))
+}
+
+func (s *SQLite) ProjectByRepository(ctx context.Context, repository string) (*model.Project, error) {
+	return scanProject(s.db.QueryRowContext(ctx, `SELECT p.id,p.name,p.repository,p.state,p.active_task_id,p.created_at,p.updated_at,COUNT(t.id) FROM projects p LEFT JOIN tasks t ON t.project_id=p.id WHERE p.repository=? GROUP BY p.id`, repository))
+}
+
+func (s *SQLite) SetProjectActiveTask(ctx context.Context, projectID, taskID string, updatedAt time.Time) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE projects SET active_task_id=?,updated_at=? WHERE id=?`, taskID, stamp(updatedAt), projectID)
+	return err
+}
+
+func (s *SQLite) AssignUnprojectedTasks(ctx context.Context, repository, projectID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET project_id=? WHERE repository=? AND (project_id IS NULL OR project_id='')`, projectID, repository)
+	return err
+}
+
+func (s *SQLite) ListProjects(ctx context.Context, limit int) ([]model.Project, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id,p.name,p.repository,p.state,p.active_task_id,p.created_at,p.updated_at,COUNT(t.id) FROM projects p LEFT JOIN tasks t ON t.project_id=p.id GROUP BY p.id ORDER BY p.updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Project
+	for rows.Next() {
+		project, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *project)
+	}
+	return out, rows.Err()
+}
+
+type projectScanner interface{ Scan(...any) error }
+
+func scanProject(row projectScanner) (*model.Project, error) {
+	var p model.Project
+	var state, created, updated string
+	if err := row.Scan(&p.ID, &p.Name, &p.Repository, &state, &p.ActiveTaskID, &created, &updated, &p.TaskCount); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	p.State = model.ProjectState(state)
+	var err error
+	p.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return nil, fmt.Errorf("parse project created_at: %w", err)
+	}
+	p.UpdatedAt, err = time.Parse(time.RFC3339Nano, updated)
+	if err != nil {
+		return nil, fmt.Errorf("parse project updated_at: %w", err)
+	}
+	return &p, nil
 }
 
 func (s *SQLite) CreateTask(ctx context.Context, task model.Task, event model.Event) error {
@@ -124,7 +241,7 @@ func (s *SQLite) CreateTask(ctx context.Context, task model.Task, event model.Ev
 	if _, err = tx.ExecContext(ctx, `INSERT INTO repositories(path,last_seen_at) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET last_seen_at=excluded.last_seen_at`, task.Repository, stamp(task.CreatedAt)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO tasks(id,repository,objective,state,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?)`, task.ID, task.Repository, task.Objective, task.State, task.Version, stamp(task.CreatedAt), stamp(task.UpdatedAt)); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO tasks(id,project_id,repository,objective,state,version,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, task.ID, task.ProjectID, task.Repository, task.Objective, task.State, task.Version, stamp(task.CreatedAt), stamp(task.UpdatedAt)); err != nil {
 		return err
 	}
 	if err = insertEvent(ctx, tx, event); err != nil {
@@ -229,12 +346,12 @@ func insertEvent(ctx context.Context, e execer, event model.Event) error {
 }
 
 func (s *SQLite) LatestTask(ctx context.Context, repo string) (*model.Task, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,repository,objective,state,version,created_at,updated_at FROM tasks WHERE repository=? ORDER BY updated_at DESC LIMIT 1`, repo)
+	row := s.db.QueryRowContext(ctx, `SELECT id,COALESCE(project_id,''),repository,objective,state,version,created_at,updated_at FROM tasks WHERE repository=? ORDER BY updated_at DESC LIMIT 1`, repo)
 	return scanTask(row)
 }
 
 func (s *SQLite) Task(ctx context.Context, id string) (*model.Task, error) {
-	return scanTask(s.db.QueryRowContext(ctx, `SELECT id,repository,objective,state,version,created_at,updated_at FROM tasks WHERE id=?`, id))
+	return scanTask(s.db.QueryRowContext(ctx, `SELECT id,COALESCE(project_id,''),repository,objective,state,version,created_at,updated_at FROM tasks WHERE id=?`, id))
 }
 
 type scanner interface{ Scan(...any) error }
@@ -242,7 +359,7 @@ type scanner interface{ Scan(...any) error }
 func scanTask(row scanner) (*model.Task, error) {
 	var t model.Task
 	var created, updated string
-	if err := row.Scan(&t.ID, &t.Repository, &t.Objective, &t.State, &t.Version, &created, &updated); errors.Is(err, sql.ErrNoRows) {
+	if err := row.Scan(&t.ID, &t.ProjectID, &t.Repository, &t.Objective, &t.State, &t.Version, &created, &updated); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	} else if err != nil {
 		return nil, err
@@ -260,7 +377,7 @@ func scanTask(row scanner) (*model.Task, error) {
 }
 
 func (s *SQLite) ListTasks(ctx context.Context, repo string, limit int) ([]model.Task, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,repository,objective,state,version,created_at,updated_at FROM tasks WHERE repository=? ORDER BY updated_at DESC LIMIT ?`, repo, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,COALESCE(project_id,''),repository,objective,state,version,created_at,updated_at FROM tasks WHERE repository=? ORDER BY updated_at DESC LIMIT ?`, repo, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -272,6 +389,23 @@ func (s *SQLite) ListTasks(ctx context.Context, repo string, limit int) ([]model
 			return nil, err
 		}
 		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) ListTasksByProject(ctx context.Context, projectID string, limit int) ([]model.Task, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,COALESCE(project_id,''),repository,objective,state,version,created_at,updated_at FROM tasks WHERE project_id=? ORDER BY updated_at DESC LIMIT ?`, projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *task)
 	}
 	return out, rows.Err()
 }

@@ -110,9 +110,15 @@ func TestStartStreamsStatusProgress(t *testing.T) {
 	sawResult := false
 	for event := range run.Events() {
 		switch event.Kind {
-		case agents.EventMessage:
+		case agents.EventProgress:
+			if event.Type != "status.md" {
+				t.Fatalf("progress type = %q, want status.md", event.Type)
+			}
 			messages = append(messages, event.Message)
 		case agents.EventResult:
+			if event.Type != "result.md" || !strings.Contains(event.Message, "answer-from-prompt-md") {
+				t.Fatalf("result event = %+v, want response from result.md", event)
+			}
 			sawResult = true
 		}
 	}

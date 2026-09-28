@@ -17,7 +17,9 @@ import (
 // print, output-format, or stream-json flags. This adapter therefore runs the
 // TUI on a pseudo-terminal and exchanges all task data through temporary
 // markdown files in the workspace (prompt.md, status.md, result.md) so rly can
-// plan, route, and trace Freebuff work like any other adapter.
+// plan, route, and trace Freebuff work like any other adapter. Freebuff is
+// globally single-session, so the adapter serializes all runs with a
+// user-scoped inter-process lock.
 type Adapter struct{ Command string }
 
 const (
@@ -72,6 +74,16 @@ func (a *Adapter) Resume(ctx context.Context, session string, r agents.Request) 
 }
 
 func (a *Adapter) run(ctx context.Context, r agents.Request) (agents.Run, error) {
+	lock, err := acquireSessionLock()
+	if err != nil {
+		return nil, err
+	}
+	keepLock := false
+	defer func() {
+		if !keepLock && lock != nil {
+			lock.release()
+		}
+	}()
 	workspace := r.Workspace
 	if strings.TrimSpace(workspace) == "" {
 		var err error
@@ -117,7 +129,8 @@ func (a *Adapter) run(ctx context.Context, r agents.Request) (agents.Run, error)
 	ch.trace("prompt.submit.complete readiness=%s", session.readinessMode())
 	ch.trace("tui.pane.after_submit=%q", session.paneSnapshot())
 
-	return newRun(ctx, session, ch, handoffRequired), nil
+	keepLock = true
+	return newRun(ctx, session, ch, handoffRequired, lock), nil
 }
 
 // run streams progress from status.md and completes when result.md appears.
@@ -127,6 +140,7 @@ type run struct {
 	session         *tuiSession
 	ch              *channel
 	handoffRequired bool
+	lock            *sessionLock
 	cancel          context.CancelFunc
 	// cancelOnce tears the process down exactly once; finishOnce delivers the
 	// terminal result exactly once. They must stay separate: cancellation can
@@ -135,7 +149,7 @@ type run struct {
 	finishOnce sync.Once
 }
 
-func newRun(ctx context.Context, session *tuiSession, ch *channel, handoffRequired bool) *run {
+func newRun(ctx context.Context, session *tuiSession, ch *channel, handoffRequired bool, lock *sessionLock) *run {
 	ctx, cancel := context.WithCancel(ctx)
 	r := &run{
 		events:          make(chan agents.Event, 32),
@@ -143,6 +157,7 @@ func newRun(ctx context.Context, session *tuiSession, ch *channel, handoffRequir
 		session:         session,
 		ch:              ch,
 		handoffRequired: handoffRequired,
+		lock:            lock,
 		cancel:          cancel,
 	}
 	go r.loop(ctx)
@@ -187,7 +202,7 @@ func (r *run) loop(ctx context.Context) {
 			// Flush status lines written before exit, then settle the outcome:
 			// result.md wins if the agent wrote it just before exiting; only a
 			// missing result.md means the run died mid-task.
-			r.emitStatus(&offset)
+			r.emitStatus(ctx, &offset)
 			result := agents.Result{ExitCode: 0}
 			if response, readErr := r.ch.readResult(); readErr == nil {
 				result.Response = strings.TrimSpace(response)
@@ -198,7 +213,7 @@ func (r *run) loop(ctx context.Context) {
 					result.Err = err
 					result.Error = err.Error()
 				} else {
-					r.events <- agents.Event{Kind: agents.EventResult, Type: "result.md", Message: result.Response}
+					r.emit(ctx, agents.Event{Kind: agents.EventResult, Type: "result.md", Message: result.Response, Data: map[string]any{"channel": "response", "path": r.ch.ResultPath()}, Time: time.Now().UTC()})
 				}
 			} else {
 				result.Err = errNoResult
@@ -222,7 +237,7 @@ func (r *run) loop(ctx context.Context) {
 			if response, readErr := r.ch.readResult(); readErr == nil && strings.TrimSpace(response) != "" {
 				response = strings.TrimSpace(response)
 				r.ch.trace("result.detected source=result.md after_fatal=true bytes=%d", len(response))
-				r.events <- agents.Event{Kind: agents.EventResult, Type: "result.md", Message: response}
+				r.emit(ctx, agents.Event{Kind: agents.EventResult, Type: "result.md", Message: response, Data: map[string]any{"channel": "response", "path": r.ch.ResultPath()}, Time: time.Now().UTC()})
 				r.finish(agents.Result{ExitCode: 0, Response: response})
 				return
 			}
@@ -239,7 +254,7 @@ func (r *run) loop(ctx context.Context) {
 				r.finish(agents.Result{ExitCode: -1, Err: err, Error: err.Error()})
 				return
 			}
-			if r.emitStatus(&offset) {
+			if r.emitStatus(ctx, &offset) {
 				lastActivity = time.Now()
 			}
 			if r.handoffRequired && !acceptedLogged && r.ch.accepted() {
@@ -287,7 +302,7 @@ func (r *run) loop(ctx context.Context) {
 				if response != "" {
 					if pendingFileResult == response {
 						r.ch.trace("result.detected source=result.md bytes=%d", len(response))
-						r.events <- agents.Event{Kind: agents.EventResult, Type: "result.md", Message: response}
+						r.emit(ctx, agents.Event{Kind: agents.EventResult, Type: "result.md", Message: response, Data: map[string]any{"channel": "response", "path": r.ch.ResultPath()}, Time: time.Now().UTC()})
 						r.finish(agents.Result{ExitCode: 0, Response: response})
 						return
 					}
@@ -303,15 +318,23 @@ func (r *run) loop(ctx context.Context) {
 // emitStatus tails new status.md content once per poll and emits it as a
 // streamed message event, which the CLI prints and traces like any other
 // adapter's progress text.
-func (r *run) emitStatus(offset *int64) bool {
+func (r *run) emitStatus(ctx context.Context, offset *int64) bool {
 	data, newOffset, err := r.ch.statusFrom(*offset)
 	if err != nil || data == "" {
 		return false
 	}
 	*offset = newOffset
 	r.ch.trace("status.read bytes=%d", len(data))
-	r.events <- agents.Event{Kind: agents.EventMessage, Type: "status.md", Message: strings.TrimRight(data, "\n")}
-	return true
+	return r.emit(ctx, agents.Event{Kind: agents.EventProgress, Type: "status.md", Message: strings.TrimRight(data, "\n"), Data: map[string]any{"channel": "status", "path": r.ch.StatusPath()}, Time: time.Now().UTC()})
+}
+
+func (r *run) emit(ctx context.Context, event agents.Event) bool {
+	select {
+	case r.events <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 var (
@@ -324,6 +347,10 @@ var (
 
 func (r *run) finish(result agents.Result) {
 	r.finishOnce.Do(func() {
+		if r.lock != nil {
+			r.lock.release()
+			r.lock = nil
+		}
 		if result.Err != nil {
 			r.ch.trace("run.finished outcome=error error=%q file_state=%s", result.Err, r.ch.fileState())
 		} else {

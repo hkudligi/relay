@@ -68,6 +68,7 @@ func Route(
 	for _, row := range inventory {
 		inventoryByAgent[row.Agent] = append(inventoryByAgent[row.Agent], row)
 	}
+	semanticProfile := AnalyzeObjective(role, objective)
 
 	names := make([]string, 0, len(adapters))
 	for name := range adapters {
@@ -80,7 +81,7 @@ func Route(
 
 	for _, name := range names {
 		adapter := adapters[name]
-		cand := evaluateCandidate(ctx, name, adapter, role, objective, inventoryByAgent[name], existingSessionAgent, policy)
+		cand := evaluateCandidate(ctx, name, adapter, role, objective, semanticProfile, inventoryByAgent[name], existingSessionAgent, policy)
 		if cand.Eligible {
 			eligibleCount++
 		}
@@ -106,6 +107,7 @@ func Route(
 		return &model.RouteDecision{
 			Role:            role,
 			Objective:       objective,
+			SemanticProfile: &semanticProfile,
 			Strategy:        policy.Strategy,
 			CandidateScores: candidates,
 		}, fmt.Errorf("%w: no eligible agent for %s role: %s", ErrAgentUnavailable, role, strings.Join(reasons, ", "))
@@ -125,6 +127,7 @@ func Route(
 	return &model.RouteDecision{
 		Role:            role,
 		Objective:       objective,
+		SemanticProfile: &semanticProfile,
 		SelectedAgent:   selected.Agent,
 		SelectedModel:   selected.SelectedModel,
 		Rationale:       rationale,
@@ -139,6 +142,7 @@ func evaluateCandidate(
 	adapter agents.Adapter,
 	role string,
 	objective string,
+	semanticProfile model.SemanticProfile,
 	modelRows []agents.ModelAvailability,
 	existingSessionAgent string,
 	policy RoutingPolicy,
@@ -181,8 +185,15 @@ func evaluateCandidate(
 	score.SelectedModel = selectModel(modelRows)
 
 	// 2. Capability / Efficacy evaluation
-	capabilityFit := evaluateEfficacy(name, role, objective, caps)
+	capabilityFit := evaluateEfficacy(name, role, objective, semanticProfile, caps)
 	score.CapabilityFit = capabilityFit
+	score.Details = map[string]any{
+		"semantic_capability_fit": semanticCapabilityFit(caps, semanticProfile.RequiredCapabilities),
+		"semantic_task_kind":      semanticProfile.TaskKind,
+		"semantic_domains":        semanticProfile.Domains,
+		"semantic_operations":     semanticProfile.Operations,
+		"semantic_risks":          semanticProfile.Risks,
+	}
 
 	// 3. Session Context evaluation
 	sessionValue := 0.0
@@ -451,7 +462,7 @@ func isTokenChar(ch byte) bool {
 	return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_'
 }
 
-func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilities) float64 {
+func evaluateEfficacy(agentName, role, objective string, semanticProfile model.SemanticProfile, caps agents.Capabilities) float64 {
 	base := 0.80
 	agentLower := strings.ToLower(agentName)
 	objLower := strings.ToLower(objective)
@@ -518,6 +529,22 @@ func evaluateEfficacy(agentName, role, objective string, caps agents.Capabilitie
 		}
 	}
 
+	if base > 1.0 {
+		base = 1.0
+	}
+	semanticFit := semanticCapabilityFit(caps, semanticProfile.RequiredCapabilities)
+	if semanticFit < 1.0 {
+		base -= (1.0 - semanticFit) * 0.12
+	}
+	if semanticProfile.NeedsReview && caps.StructuredOutput {
+		base += 0.02
+	}
+	if semanticProfile.LongRunning && !caps.SessionResume {
+		base -= 0.04
+	}
+	if base < 0 {
+		base = 0
+	}
 	if base > 1.0 {
 		base = 1.0
 	}

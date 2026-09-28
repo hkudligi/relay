@@ -11,17 +11,17 @@ import (
 	"github.com/harsha/relay/internal/agents"
 )
 
-// DiscoverModels uses agy's provider-backed model command when it returns
-// structured output. Current agy releases do not expose quota percentages, so
-// those values are intentionally UNKNOWN.
+// DiscoverModels uses agy's provider-backed model command and /usage command.
+// /usage reports shared buckets, so each discovered model is mapped to the
+// provider bucket covering its model family.
 func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability {
 	installation := a.Detect(ctx)
 	if !installation.Available {
 		return []agents.ModelAvailability{agents.UnknownAvailability(installation, "agy --version", installation.Error)}
 	}
-	discoveryCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-	defer cancel()
-	output, err := exec.CommandContext(discoveryCtx, a.Command, "models").Output()
+	modelsCtx, modelsCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer modelsCancel()
+	output, err := exec.CommandContext(modelsCtx, a.Command, "models").Output()
 	if err != nil {
 		row := agents.UnknownAvailability(installation, "agy models; quota API unavailable", err.Error())
 		// Failure to enumerate models does not prove that the provider is
@@ -82,10 +82,83 @@ func (a *Adapter) DiscoverModels(ctx context.Context) []agents.ModelAvailability
 		// successful usability check without guessing model identifiers.
 		names = []string{"UNKNOWN"}
 	}
+	// Keep the usage probe on its own deadline. Agy may spend several seconds
+	// starting up and fetching models, and /usage is a separate invocation.
+	usageCtx, usageCancel := context.WithTimeout(ctx, 8*time.Second)
+	defer usageCancel()
+	usageByFamily := discoverUsage(usageCtx, a.Command)
 	sort.Strings(names)
 	rows := make([]agents.ModelAvailability, 0, len(names))
 	for _, name := range names {
-		rows = append(rows, agents.ModelAvailability{Agent: a.Name(), Model: name, Version: installation.Version, Installed: true, Usable: true, Confidence: agents.ConfidenceExact, DataSource: "agy models; provider quota unavailable"})
+		remaining, ok := usageByFamily[agyModelFamily(name)]
+		confidence := agents.ConfidenceUnknown
+		source := "agy models; /usage unavailable for model family"
+		if ok {
+			confidence = agents.ConfidenceExact
+			source = "agy /usage grouped weekly limit"
+		}
+		rows = append(rows, agents.ModelAvailability{Agent: a.Name(), Model: name, Version: installation.Version, Installed: true, Usable: true, RemainingPercent: remaining, Confidence: confidence, DataSource: source})
 	}
 	return rows
+}
+
+type usageBucket struct {
+	RemainingFraction *float64 `json:"remaining_fraction"`
+}
+
+type usageGroup struct {
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
+	Buckets     []usageBucket `json:"buckets"`
+}
+
+func discoverUsage(ctx context.Context, command string) map[string]*float64 {
+	output, err := exec.CommandContext(ctx, command, "-p", "/usage", "--output-format", "stream-json").Output()
+	if err != nil {
+		return nil
+	}
+	var groups []usageGroup
+	for _, line := range strings.Split(string(output), "\n") {
+		var event struct {
+			Command struct {
+				Data struct {
+					Groups []usageGroup `json:"groups"`
+				} `json:"data"`
+			} `json:"command"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && len(event.Command.Data.Groups) > 0 {
+			groups = event.Command.Data.Groups
+			break
+		}
+	}
+	result := map[string]*float64{}
+	for _, group := range groups {
+		if len(group.Buckets) == 0 || group.Buckets[0].RemainingFraction == nil {
+			continue
+		}
+		remaining := *group.Buckets[0].RemainingFraction * 100
+		if remaining < 0 {
+			remaining = 0
+		}
+		if remaining > 100 {
+			remaining = 100
+		}
+		value := remaining
+		family := agyModelFamily(group.Name + " " + group.Description)
+		if family != "" {
+			result[family] = &value
+		}
+	}
+	return result
+}
+
+func agyModelFamily(name string) string {
+	value := strings.ToLower(name)
+	if strings.Contains(value, "gemini") {
+		return "gemini"
+	}
+	if strings.Contains(value, "claude") || strings.Contains(value, "gpt") {
+		return "third-party"
+	}
+	return ""
 }

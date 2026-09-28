@@ -132,6 +132,7 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy: balanced, conservative, or quality-first")
 		minReserve := fs.Float64("min-reserve", 15.0, "minimum token headroom percentage to reserve before routing")
 		maxTotalTokens := fs.Int64("max-total-tokens", 0, "maximum estimated total tokens for this task")
+		projectID := fs.String("project", "", "project ID to append this task to")
 		agyWeight := fs.Float64("agy-weight", 1.0, "agent priority weight for Agy")
 		codexWeight := fs.Float64("codex-weight", 0.9, "agent priority weight for Codex")
 		cursorWeight := fs.Float64("cursor-weight", 0.8, "agent priority weight for Cursor")
@@ -176,7 +177,7 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 				"agy": *agyWeight, "codex": *codexWeight, "cursor": *cursorWeight, "freebuff": *freebuffWeight,
 			},
 		}
-		return a.executeObjectiveWithRouter(ctx, svc, repo, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit, MaxTotalTokens: *maxTotalTokens}, *jsonOut)
+		return a.executeObjectiveWithRouter(ctx, svc, repo, *projectID, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit, MaxTotalTokens: *maxTotalTokens}, *jsonOut)
 	case "agents":
 		jsonOut, ok := parseJSONOnly(args[1:], a.Err)
 		if !ok {
@@ -216,6 +217,74 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		}
 		a.printTasks(ts)
 		return ExitOK
+	case "projects":
+		jsonOut, ok := parseJSONOnly(args[1:], a.Err)
+		if !ok {
+			return ExitInvalid
+		}
+		projects, err := svc.Projects(ctx)
+		if err != nil {
+			return a.fail(err)
+		}
+		if jsonOut {
+			return a.json(projects)
+		}
+		a.printProjects(projects)
+		return ExitOK
+	case "project":
+		fs := flag.NewFlagSet("project", flag.ContinueOnError)
+		fs.SetOutput(a.Err)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return ExitInvalid
+		}
+		if fs.NArg() != 1 {
+			fmt.Fprintln(a.Err, "rly project: project id is required")
+			return ExitInvalid
+		}
+		project, tasks, err := svc.Project(ctx, fs.Arg(0))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				fmt.Fprintf(a.Err, "project %s not found\n", fs.Arg(0))
+				return ExitInvalid
+			}
+			return a.fail(err)
+		}
+		if *jsonOut {
+			return a.json(struct {
+				Project model.Project `json:"project"`
+				Tasks   []model.Task  `json:"tasks"`
+			}{*project, tasks})
+		}
+		fmt.Fprintf(a.Out, "%s  %s  %s  tasks=%d\n", project.ID, project.State, project.Repository, project.TaskCount)
+		for _, task := range tasks {
+			fmt.Fprintf(a.Out, "  %s  %-12s %s\n", task.ID, task.State, task.Objective)
+		}
+		return ExitOK
+	case "resume":
+		fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+		fs.SetOutput(a.Err)
+		jsonOut := fs.Bool("json", false, "emit JSON")
+		if err := fs.Parse(args[1:]); err != nil {
+			return ExitInvalid
+		}
+		if fs.NArg() != 1 {
+			fmt.Fprintln(a.Err, "rly resume: task id is required")
+			return ExitInvalid
+		}
+		previous, err := svc.Task(ctx, fs.Arg(0))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				fmt.Fprintf(a.Err, "task %s not found\n", fs.Arg(0))
+				return ExitInvalid
+			}
+			return a.fail(err)
+		}
+		if previous.Repository != repo {
+			fmt.Fprintf(a.Err, "task %s belongs to %s\n", previous.ID, previous.Repository)
+			return ExitInvalid
+		}
+		return a.executeObjectiveWithRouter(ctx, svc, repo, previous.ProjectID, previous.Objective, "", "auto", core.DefaultRoutingPolicy(), agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, *jsonOut)
 	case "ops":
 		fs := flag.NewFlagSet("ops", flag.ContinueOnError)
 		fs.SetOutput(a.Err)
@@ -340,7 +409,7 @@ func (a *App) repl(ctx context.Context, svc *core.Service, repo string) int {
 				fmt.Fprintln(a.Err, "rly: default codex adapter is not configured")
 				continue
 			}
-			_ = a.executeObjectiveWithRouter(ctx, svc, repo, line, "", "auto", core.DefaultRoutingPolicy(), agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, false)
+			_ = a.executeObjectiveWithRouter(ctx, svc, repo, "", line, "", "auto", core.DefaultRoutingPolicy(), agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, false)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -377,10 +446,10 @@ func (a *App) executeObjectiveWithPlanner(ctx context.Context, svc *core.Service
 	if adapter != nil {
 		agentName = adapter.Name()
 	}
-	return a.executeObjectiveWithRouter(ctx, svc, repo, objective, plannerName, agentName, core.DefaultRoutingPolicy(), request, jsonOut)
+	return a.executeObjectiveWithRouter(ctx, svc, repo, "", objective, plannerName, agentName, core.DefaultRoutingPolicy(), request, jsonOut)
 }
 
-func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service, repo, objective, plannerName, agentName string, policy core.RoutingPolicy, request agents.Request, jsonOut bool) int {
+func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service, repo, projectID, objective, plannerName, agentName string, policy core.RoutingPolicy, request agents.Request, jsonOut bool) int {
 	if plannerName == "freebuff" {
 		if jsonOut {
 			_ = a.json(runOutput{Error: "freebuff is execution-only and cannot be used as a planner"})
@@ -390,16 +459,18 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		return ExitInvalid
 	}
 	inventory := a.discoverInventory(ctx)
-	if !jsonOut {
-		a.printInventory(inventory)
+	var t *model.Task
+	var err error
+	if projectID != "" {
+		t, err = svc.StartTaskWithInventoryForProject(ctx, projectID, repo, objective, inventory)
+	} else {
+		t, err = svc.StartTaskWithInventory(ctx, repo, objective, inventory)
 	}
-	t, err := svc.StartTaskWithInventory(ctx, repo, objective, inventory)
 	if err != nil {
 		return a.fail(err)
 	}
 
 	var planner agents.Adapter
-	var plannerDecision *model.RouteDecision
 	plannerModel := ""
 	if plannerName == "auto" {
 		planningAdapters, planningInventory := planningCandidates(a.Adapters, inventory)
@@ -413,7 +484,6 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		}
 		planner = a.Adapters[planDecision.SelectedAgent]
 		plannerModel = planDecision.SelectedModel
-		plannerDecision = planDecision
 	} else if plannerName != "" {
 		var exists bool
 		planner, exists = a.Adapters[plannerName]
@@ -423,7 +493,6 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		}
 		if planDecision, routeErr := svc.Route(ctx, t.ID, core.RolePlanning, objective, map[string]agents.Adapter{plannerName: planner}, inventory, policy); routeErr == nil {
 			plannerModel = planDecision.SelectedModel
-			plannerDecision = planDecision
 		}
 	}
 
@@ -457,59 +526,39 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		}
 	}
 
+	var renderer *runRenderer
 	if !jsonOut {
-		// Keep the routing summary compact and make the two actors explicit. The
-		// phase banners below are the authoritative progress display; this line
-		// gives the user the complete assignment before either process starts.
+		plannerLabel := ""
 		if planner != nil {
-			fmt.Fprintf(a.Out, "agents: planner=%s model=%s | executor=%s model=%s\n", planner.Name(), routeModelLabel(plannerModel), adapter.Name(), routeModelLabel(request.Model))
-			fmt.Fprintf(a.Out, "router: planner %s model=%s [read-only plan]\n", planner.Name(), routeModelLabel(plannerModel))
-			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
-			if plannerDecision != nil && plannerDecision.Rationale != "" {
-				fmt.Fprintf(a.Out, "routing: planner=%s (%s)\n", planner.Name(), plannerDecision.Rationale)
-			}
-			if primaryDecision != nil && primaryDecision.Rationale != "" {
-				fmt.Fprintf(a.Out, "routing: executor=%s (%s)\n", adapter.Name(), primaryDecision.Rationale)
-			}
-		} else if primaryDecision != nil && primaryDecision.Rationale != "" {
-			fmt.Fprintf(a.Out, "agents: executor=%s model=%s\nrouting: executor=%s (%s)\n", adapter.Name(), routeModelLabel(request.Model), adapter.Name(), primaryDecision.Rationale)
-			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
-		} else {
-			fmt.Fprintf(a.Out, "agents: executor=%s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
-			fmt.Fprintf(a.Out, "router: implementer %s model=%s\n", adapter.Name(), routeModelLabel(request.Model))
+			plannerLabel = planner.Name()
 		}
-		if planner != nil {
-			// Retain the compact flow marker for trace readability and backwards
-			// compatibility with existing terminal consumers.
-			fmt.Fprintf(a.Out, "%s  %s → planner %s (%s) → implementer %s (%s)\n", t.ID, t.State, planner.Name(), routeModelLabel(plannerModel), adapter.Name(), routeModelLabel(request.Model))
-		} else {
-			fmt.Fprintf(a.Out, "%s  %s → implementer %s (%s)\n", t.ID, t.State, adapter.Name(), routeModelLabel(request.Model))
-		}
+		renderer = newRunRenderer(a.Out, t, objective, inventory, plannerLabel, plannerModel, adapter.Name(), request.Model)
+		renderer.Start()
 	}
 
 	emit := func(event agents.Event) {
-		if !jsonOut {
-			printAgentEvent(a.Out, "executor", adapter.Name(), request.Model, event)
+		if renderer != nil {
+			renderer.Event("executor", event)
 		}
 	}
 
 	runExecution := func() (*core.Execution, error) {
 		executorPhasePrinted := false
-		if !jsonOut {
+		if renderer != nil {
 			if planner != nil {
-				fmt.Fprintf(a.Out, "\nPHASE 1/2 · PLAN  | planner=%s model=%s | action=inspect repository and prepare executor handoff\n", planner.Name(), routeModelLabel(plannerModel))
+				renderer.Phase("planner")
 			} else {
-				fmt.Fprintf(a.Out, "\nPHASE 1/1 · EXECUTE | executor=%s model=%s | action=implement repository changes\n", adapter.Name(), routeModelLabel(request.Model))
+				renderer.Phase("executor")
 			}
 		}
 		if planner != nil {
 			return svc.ExecuteWithPlan(ctx, t, planner, adapter, plannerModel, request, func(event agents.Event) {
-				if !jsonOut {
-					printAgentEvent(a.Out, "planner", planner.Name(), plannerModel, event)
+				if renderer != nil {
+					renderer.Event("planner", event)
 				}
 			}, func(event agents.Event) {
-				if !jsonOut && !executorPhasePrinted {
-					fmt.Fprintf(a.Out, "\nPHASE 2/2 · EXECUTE | executor=%s model=%s | action=implement repository changes\n", adapter.Name(), routeModelLabel(request.Model))
+				if renderer != nil && !executorPhasePrinted {
+					renderer.Phase("executor")
 					executorPhasePrinted = true
 				}
 				emit(event)
@@ -517,8 +566,38 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		}
 		return svc.Execute(ctx, t, adapter, request, emit)
 	}
+	// Provider tools can remain active for a long time without emitting a new
+	// stream event. Keep the terminal informative while the execution itself
+	// remains fully asynchronous and cancellable through the parent context.
+	runExecutionWithHeartbeat := func() (*core.Execution, error) {
+		if jsonOut {
+			return runExecution()
+		}
+		type executionOutcome struct {
+			execution *core.Execution
+			err       error
+		}
+		outcomes := make(chan executionOutcome, 1)
+		started := time.Now()
+		go func() {
+			execution, err := runExecution()
+			outcomes <- executionOutcome{execution: execution, err: err}
+		}()
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case outcome := <-outcomes:
+				return outcome.execution, outcome.err
+			case <-ticker.C:
+				if renderer != nil {
+					renderer.Heartbeat("executor", time.Since(started))
+				}
+			}
+		}
+	}
 
-	execution, runErr := runExecution()
+	execution, runErr := runExecutionWithHeartbeat()
 	// A provider with UNKNOWN quota can still reject a planning request at
 	// runtime. ExecuteWithPlan returns before the executor in that case, so
 	// retry planning once with the next eligible provider.
@@ -526,12 +605,12 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		fallbackInventory := filterFailedModel(inventory, planner.Name(), plannerModel)
 		fallbackAdapters, fallbackInventory := planningCandidates(adaptersForInventory(a.Adapters, fallbackInventory), fallbackInventory)
 		if fallbackDecision, routeErr := svc.Route(ctx, t.ID, core.RolePlanning, objective, fallbackAdapters, fallbackInventory, policy); routeErr == nil {
-			if !jsonOut {
-				fmt.Fprintf(a.Out, "retrying after %s %s: %s model=%s\n", planner.Name(), retryReason(planner, runErr), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
+			if renderer != nil {
+				renderer.Retry("planner", planner.Name(), retryReason(planner, runErr), fallbackDecision.SelectedAgent, fallbackDecision.SelectedModel)
 			}
 			planner = fallbackAdapters[fallbackDecision.SelectedAgent]
 			plannerModel = fallbackDecision.SelectedModel
-			execution, runErr = runExecution()
+			execution, runErr = runExecutionWithHeartbeat()
 		}
 	}
 	// Providers can reject a discovered model at runtime. Remove the failed
@@ -568,13 +647,13 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 			if routeErr != nil {
 				break
 			}
-			if !jsonOut {
-				fmt.Fprintf(a.Out, "retrying after %s %s: %s model=%s\n", adapter.Name(), retryReason(adapter, runErr), fallbackDecision.SelectedAgent, routeModelLabel(fallbackDecision.SelectedModel))
+			if renderer != nil {
+				renderer.Retry("executor", adapter.Name(), retryReason(adapter, runErr), fallbackDecision.SelectedAgent, fallbackDecision.SelectedModel)
 			}
 			adapter = fallbackAdapters[fallbackDecision.SelectedAgent]
 			primaryDecision = fallbackDecision
 			request.Model = fallbackDecision.SelectedModel
-			execution, runErr = runExecution()
+			execution, runErr = runExecutionWithHeartbeat()
 		}
 	}
 	if runErr == nil && execution != nil && adapter.Name() == "freebuff" {
@@ -582,24 +661,24 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		if delegationErr != nil {
 			runErr = delegationErr
 		} else if len(delegations) > 0 {
-			if !jsonOut {
-				fmt.Fprintf(a.Out, "\nDELEGATED SUBAGENTS · launching %d vendor task(s)\n", len(delegations))
+			if renderer != nil {
+				renderer.Delegation(len(delegations))
 			}
 			delegatedTasks := core.DelegatedAgentTasks(delegations, repo, request.Sandbox)
 			delegated := core.Orchestrator{
 				Adapters: a.Adapters,
 				Mode:     core.ExecutionParallel,
 				OnEvent: func(task core.AgentTask, event agents.Event) {
-					if !jsonOut {
-						printAgentEvent(a.Out, "subagent/"+task.ID, task.Agent, task.Request.Model, event)
+					if renderer != nil {
+						renderer.Event("executor", agents.Event{Kind: event.Kind, Type: event.Type, SessionID: event.SessionID, Message: task.ID + ": " + event.Message, Usage: event.Usage, Data: event.Data, Time: event.Time})
 					}
 				},
 			}
 			_, delegationErr = delegated.Run(ctx, delegatedTasks)
 			if delegationErr != nil {
 				runErr = delegationErr
-			} else if !jsonOut {
-				fmt.Fprintln(a.Out, "✓ delegated vendor tasks completed")
+			} else if renderer != nil {
+				renderer.DelegationDone()
 			}
 		}
 	}
@@ -615,14 +694,17 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		_ = a.json(output)
 	}
 	if runErr != nil {
+		if renderer != nil {
+			renderer.Fail(runErr)
+		}
 		if errors.Is(runErr, core.ErrAgentUnavailable) {
 			fmt.Fprintln(a.Err, runErr)
 			return ExitAgentUnavailable
 		}
 		return a.fail(runErr)
 	}
-	if !jsonOut {
-		fmt.Fprintf(a.Out, "✓ %s (%s)\n", execution.Task.State, execution.Result.SessionID)
+	if renderer != nil {
+		renderer.Finish(execution.Task.State, execution.Result.SessionID)
 	}
 	return ExitOK
 }
@@ -643,8 +725,16 @@ func printAgentEvent(out io.Writer, role, adapter, model string, event agents.Ev
 		if !strings.HasSuffix(event.Message, "\n") {
 			fmt.Fprintln(out)
 		}
+	case agents.EventResult:
+		detail := latestProgressLine(event.Message)
+		if detail == "" {
+			detail = strings.TrimSpace(event.Type)
+		}
+		if detail != "" {
+			fmt.Fprintf(out, "%s response: %s\n", label, detail)
+		}
 	case agents.EventProgress:
-		detail := strings.TrimSpace(event.Message)
+		detail := latestProgressLine(event.Message)
 		if detail == "" {
 			detail = strings.TrimSpace(event.Type)
 		}
@@ -673,6 +763,17 @@ func printAgentEvent(out io.Writer, role, adapter, model string, event agents.Ev
 			fmt.Fprintf(out, "%s error\n", label)
 		}
 	}
+}
+
+func latestProgressLine(message string) string {
+	lines := strings.Split(strings.ReplaceAll(message, "\r\n", "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func (a *App) discoverInventory(ctx context.Context) []agents.ModelAvailability {
@@ -779,6 +880,9 @@ func shouldRetryAgent(adapter agents.Adapter, err error) bool {
 	if err == nil {
 		return false
 	}
+	if adapter.Name() == "freebuff" && errors.Is(err, freebuff.ErrSessionConflict) {
+		return false
+	}
 	// Agy model failures are retried against the next discovered model. Freebuff
 	// readiness, idle-timeout, and result-file failures are also operational
 	// failures that can be retried by the routing layer.
@@ -864,12 +968,13 @@ func yesNo(value bool) string {
 }
 
 func (a *App) printStatus(st model.Status) {
+	color := supportsColor(a.Out)
 	fmt.Fprintf(a.Out, "repo: %s\n", filepath.Base(st.Repository))
 	if st.Task == nil {
 		fmt.Fprintln(a.Out, "task: none")
 		return
 	}
-	fmt.Fprintf(a.Out, "task: %s\nstate: %s\nobjective: %s\n", st.Task.ID, st.Task.State, st.Task.Objective)
+	fmt.Fprintf(a.Out, "task: %s\nstate: %s\nobjective: %s\n", st.Task.ID, statusColor(color, st.Task.State), st.Task.Objective)
 }
 
 func (a *App) printTasks(ts []model.Task) {
@@ -879,6 +984,21 @@ func (a *App) printTasks(ts []model.Task) {
 	}
 	for _, t := range ts {
 		fmt.Fprintf(a.Out, "%-18s %-12s %s\n", t.ID, t.State, t.Objective)
+	}
+}
+
+func (a *App) printProjects(projects []model.Project) {
+	if len(projects) == 0 {
+		fmt.Fprintln(a.Out, "No projects.")
+		return
+	}
+	for _, project := range projects {
+		active := project.ActiveTaskID
+		if active == "" {
+			active = "-"
+		}
+		fmt.Fprintf(a.Out, "%s  %-8s %-24s tasks=%d active=%s\n", project.ID, project.State, project.Name, project.TaskCount, active)
+		fmt.Fprintf(a.Out, "  %s\n", project.Repository)
 	}
 }
 
@@ -954,10 +1074,13 @@ func (a *App) help() {
 
 Usage:
   rly [--state PATH]
-  rly [--state PATH] run [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--agy-weight N] [--codex-weight N] [--cursor-weight N] [--freebuff-weight N] [--sandbox MODE] [--json] <objective>
+  rly [--state PATH] run [--project ID] [--planner codex|agy|cursor|auto] [--agent codex|agy|cursor|freebuff|auto] [--strategy balanced|conservative|quality-first] [--min-reserve PCT] [--agy-weight N] [--codex-weight N] [--cursor-weight N] [--freebuff-weight N] [--sandbox MODE] [--json] <objective>
   rly [--state PATH] agents [--json]
   rly [--state PATH] status [--json]
   rly [--state PATH] tasks [--json]
+  rly [--state PATH] projects [--json]
+  rly [--state PATH] project [--json] <project-id>
+  rly [--state PATH] resume [--json] <task-id>
   rly [--state PATH] ops [--aging DURATION] [--json]
   rly [--state PATH] cancel [--reason TEXT] [--idempotency-key KEY] [--json] <task-id>
   rly [--state PATH] memory [--json]
