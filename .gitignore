@@ -10,3 +10,4 @@ homebrew/bin/rly
 .codex/
 /.tmp
 /.relay
+/.gocache

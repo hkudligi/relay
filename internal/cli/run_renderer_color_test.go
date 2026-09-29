@@ -87,6 +87,48 @@ func TestRunRendererPrintsResultEvents(t *testing.T) {
 	}
 }
 
+func TestRunRendererFinishPrintsFullResult(t *testing.T) {
+	var out strings.Builder
+	renderer := &runRenderer{
+		out:       &out,
+		executor:  &runActorView{Role: "executor", Status: "running", Adapter: "freebuff"},
+		started:   time.Now(),
+		taskState: model.TaskRunning,
+	}
+	renderer.Event("executor", agents.Event{Kind: agents.EventResult, Type: "result.md", Message: "first line\nfinal answer"})
+	renderer.Finish(model.TaskCompleted, "freebuff:/tmp/run")
+
+	got := out.String()
+	if !strings.Contains(got, "response\nfirst line\nfinal answer\n\n") {
+		t.Fatalf("output = %q, want full response block", got)
+	}
+	if !strings.Contains(got, "done    COMPLETED (freebuff:/tmp/run)") {
+		t.Fatalf("output = %q, want completion line", got)
+	}
+}
+
+func TestRunRendererFinishPrintsFinalResponseWhenResultEventHasNoMessage(t *testing.T) {
+	var out strings.Builder
+	renderer := &runRenderer{
+		out:       &out,
+		executor:  &runActorView{Role: "executor", Status: "running", Adapter: "codex"},
+		started:   time.Now(),
+		taskState: model.TaskRunning,
+	}
+	renderer.Event("executor", agents.Event{Kind: agents.EventMessage, Message: "codex final answer"})
+	renderer.Event("executor", agents.Event{Kind: agents.EventResult, Type: "turn.completed", Usage: agents.Usage{TotalTokens: 12}})
+	renderer.SetResult("executor", "codex final answer")
+	renderer.Finish(model.TaskCompleted, "thread-123")
+
+	got := out.String()
+	if !strings.Contains(got, "response\ncodex final answer\n\n") {
+		t.Fatalf("output = %q, want final response block", got)
+	}
+	if !strings.Contains(got, "done    COMPLETED (thread-123)") {
+		t.Fatalf("output = %q, want completion line", got)
+	}
+}
+
 func TestActorLineColorMatchesPlainLayout(t *testing.T) {
 	actor := &runActorView{Role: "executor", Status: "running", Adapter: "codex", Model: "gpt-5.6"}
 	plain := actorLineColor(false, actor)

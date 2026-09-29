@@ -117,32 +117,11 @@ func TestOrchestratorTracksPromptAndAgentTokenUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Usage.TotalTokens != 9 {
-		t.Fatalf("total tokens=%d, want estimated prompt 2 + result 7", result.Usage.TotalTokens)
+	if result.Usage.TotalTokens != 7 {
+		t.Fatalf("total tokens=%d, want result usage 7", result.Usage.TotalTokens)
 	}
-	if result.AgentUsage["fake"].TotalTokens != 9 {
-		t.Fatalf("agent tokens=%d, want 9", result.AgentUsage["fake"].TotalTokens)
-	}
-}
-
-func TestOrchestratorStopsBeforeExceedingTokenBudget(t *testing.T) {
-	adapter := &orchestrationAdapter{}
-	o := core.Orchestrator{
-		Adapters:    map[string]agents.Adapter{"fake": adapter},
-		Mode:        core.ExecutionSequential,
-		TokenBudget: core.TokenBudget{MaxTotalTokens: 1},
-	}
-	result, err := o.Run(context.Background(), []core.AgentTask{
-		{ID: "a", Agent: "fake", ReadOnly: true, Request: agents.Request{Prompt: "12345678"}},
-	})
-	if err == nil {
-		t.Fatal("expected budget error")
-	}
-	if len(adapter.started) != 0 {
-		t.Fatalf("started=%v, want no launched tasks", adapter.started)
-	}
-	if len(result.Results) != 1 || !result.Results[0].Skipped {
-		t.Fatalf("results=%+v, want skipped budget result", result.Results)
+	if result.AgentUsage["fake"].TotalTokens != 7 {
+		t.Fatalf("agent tokens=%d, want 7", result.AgentUsage["fake"].TotalTokens)
 	}
 }
 
@@ -165,5 +144,65 @@ func TestOrchestratorSerializesWorkspaceWritesAndHonorsDependencies(t *testing.T
 	}
 	if len(adapter.started) != 2 || adapter.started[0] != "write" || !strings.HasPrefix(adapter.started[1], "after") {
 		t.Fatalf("started=%v, want dependency order", adapter.started)
+	}
+}
+
+// singleSessionAdapter models an adapter like freebuff: only one active
+// session per account is permitted.
+type singleSessionAdapter struct {
+	orchestrationAdapter
+}
+
+func (a *singleSessionAdapter) Name() string { return "freebuff" }
+func (a *singleSessionAdapter) Capabilities() agents.Capabilities {
+	return agents.Capabilities{NonInteractive: true, Streaming: true, Cancellation: true, FileEditing: true, SingleSession: true}
+}
+
+func TestOrchestratorSerializesRolesOnSingleSessionAdapter(t *testing.T) {
+	// Two roles (e.g. planner and executor) both route to a single-session
+	// agent. Even in parallel mode they must never run at the same time; the
+	// second waits for the next round and reuses the one account session.
+	adapter := &singleSessionAdapter{orchestrationAdapter{delay: 25 * time.Millisecond}}
+	o := core.Orchestrator{Adapters: map[string]agents.Adapter{"freebuff": adapter}, Mode: core.ExecutionParallel}
+	result, err := o.Run(context.Background(), []core.AgentTask{
+		{ID: "plan", Agent: "freebuff", ReadOnly: true, Request: agents.Request{Prompt: "plan"}},
+		{ID: "execute", Agent: "freebuff", ReadOnly: true, Request: agents.Request{Prompt: "execute"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.max != 1 {
+		t.Fatalf("max_concurrency=%d, want 1 for single-session adapter", adapter.max)
+	}
+	if len(result.Results) != 2 {
+		t.Fatalf("results=%d, want both roles completed", len(result.Results))
+	}
+}
+
+func TestOrchestratorKeepsIndependentAdaptersParallelBesideSingleSessionTask(t *testing.T) {
+	// A single-session task must not flatten the whole batch: other adapters
+	// without the constraint still run concurrently with it.
+	freebuff := &singleSessionAdapter{orchestrationAdapter{delay: 25 * time.Millisecond}}
+	plain := &orchestrationAdapter{delay: 25 * time.Millisecond}
+	o := core.Orchestrator{
+		Adapters: map[string]agents.Adapter{"freebuff": freebuff, "plain": plain},
+		Mode:     core.ExecutionParallel,
+	}
+	_, err := o.Run(context.Background(), []core.AgentTask{
+		{ID: "one", Agent: "freebuff", ReadOnly: true, Request: agents.Request{Prompt: "one"}},
+		{ID: "two", Agent: "freebuff", ReadOnly: true, Request: agents.Request{Prompt: "two"}},
+		{ID: "three", Agent: "plain", ReadOnly: true, Request: agents.Request{Prompt: "three"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freebuff.max != 1 {
+		t.Fatalf("freebuff max_concurrency=%d, want 1", freebuff.max)
+	}
+	if plain.max != 1 {
+		t.Fatalf("plain max_concurrency=%d, want 1", plain.max)
+	}
+	if len(plain.started) != 1 {
+		t.Fatalf("plain started=%v, want its task launched in the first batch", plain.started)
 	}
 }

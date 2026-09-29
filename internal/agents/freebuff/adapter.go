@@ -55,6 +55,9 @@ func (a *Adapter) Capabilities() agents.Capabilities {
 		Cancellation:     true,
 		UsageReporting:   false,
 		FileEditing:      true,
+		// Freebuff enforces one active session per account; the adapter's
+		// user-scoped session lock also fails fast with ErrSessionConflict.
+		SingleSession: true,
 	}
 }
 

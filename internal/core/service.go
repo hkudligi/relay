@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -23,7 +22,6 @@ import (
 
 var ErrAgentUnavailable = fmt.Errorf("agent unavailable")
 var ErrAccessDenied = fmt.Errorf("access denied")
-var ErrCostLimitExceeded = fmt.Errorf("cost limit exceeded")
 var ErrTaskIncomplete = fmt.Errorf("task incomplete")
 
 const (
@@ -36,31 +34,6 @@ const (
 type Execution struct {
 	Task   *model.Task   `json:"task"`
 	Result agents.Result `json:"result"`
-}
-
-// PlanResult is the durable result of a planning-only agent run. The task
-// remains in PLANNING so an executor can consume the plan afterwards.
-type PlanResult struct {
-	Task   *model.Task   `json:"task"`
-	Result agents.Result `json:"result"`
-}
-
-type OperationalDashboard struct {
-	Repository     string                   `json:"repository"`
-	GeneratedAt    time.Time                `json:"generated_at"`
-	AgingThreshold string                   `json:"aging_threshold"`
-	Counts         map[model.TaskState]int  `json:"counts"`
-	Tasks          []OperationalTaskSummary `json:"tasks"`
-}
-
-type OperationalTaskSummary struct {
-	ID          string          `json:"id"`
-	State       model.TaskState `json:"state"`
-	Objective   string          `json:"objective"`
-	UpdatedAt   time.Time       `json:"updated_at"`
-	AgeSeconds  int64           `json:"age_seconds"`
-	NeedsAction bool            `json:"needs_action"`
-	Reason      string          `json:"reason,omitempty"`
 }
 
 type Service struct {
@@ -153,43 +126,7 @@ func (s *Service) startTask(ctx context.Context, projectID, repo, objective stri
 	if err != nil {
 		return nil, err
 	}
-	if err := initializeTaskArtifacts(*task); err != nil {
-		return nil, err
-	}
 	return task, nil
-}
-
-func initializeTaskArtifacts(task model.Task) error {
-	info, err := os.Stat(task.Repository)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("inspect repository for task artifacts: %w", err)
-	}
-	if !info.IsDir() {
-		return nil
-	}
-	root := filepath.Join(task.Repository, ".relay", "tasks", task.ID)
-	for _, dir := range []string{root, filepath.Join(root, "evidence"), filepath.Join(root, "handoffs")} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return fmt.Errorf("create task artifact directory %s: %w", dir, err)
-		}
-	}
-	files := map[string]string{
-		"objective.md": fmt.Sprintf("# Objective\n\n%s\n\n## Acceptance Criteria\n\n- [ ] Define concrete acceptance criteria before implementation completes.\n", task.Objective),
-		"plan.md":      "# Plan\n\n- [ ] Capture phases, dependencies, likely files, validation commands, risks, and stopping conditions.\n",
-		"decisions.md": "# Decisions\n\nNo durable decisions recorded yet.\n",
-		"findings.md":  "# Findings\n\nNo repository findings recorded yet.\n",
-		"progress.md":  "# Progress\n\n- [x] Task artifact workspace initialized.\n- [ ] Record completed work, remaining work, and the next recommended action.\n",
-		"questions.md": "# Questions\n\nNo questions waiting for the user.\n",
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o600); err != nil {
-			return fmt.Errorf("write task artifact %s: %w", name, err)
-		}
-	}
-	return writeTaskArtifactState(root, newTaskArtifactState(task))
 }
 
 func (s *Service) Status(ctx context.Context, repo string) (model.Status, error) {
@@ -217,51 +154,6 @@ func (s *Service) Project(ctx context.Context, id string) (*model.Project, []mod
 		return nil, nil, err
 	}
 	return project, tasks, nil
-}
-func (s *Service) Operations(ctx context.Context, repo string, agingThreshold time.Duration) (OperationalDashboard, error) {
-	if agingThreshold <= 0 {
-		agingThreshold = 24 * time.Hour
-	}
-	now := s.now().UTC()
-	tasks, err := s.store.ListTasks(ctx, repo, 100)
-	if err != nil {
-		return OperationalDashboard{}, err
-	}
-	dashboard := OperationalDashboard{
-		Repository:     repo,
-		GeneratedAt:    now,
-		AgingThreshold: agingThreshold.String(),
-		Counts:         make(map[model.TaskState]int),
-	}
-	for _, task := range tasks {
-		dashboard.Counts[task.State]++
-		age := now.Sub(task.UpdatedAt)
-		item := OperationalTaskSummary{
-			ID:         task.ID,
-			State:      task.State,
-			Objective:  task.Objective,
-			UpdatedAt:  task.UpdatedAt,
-			AgeSeconds: int64(age.Seconds()),
-		}
-		switch {
-		case task.State == model.TaskBlocked:
-			item.NeedsAction = true
-			item.Reason = "blocked"
-		case task.State == model.TaskWaitingForUser:
-			item.NeedsAction = true
-			item.Reason = "waiting for user"
-		case task.State == model.TaskFailed:
-			item.NeedsAction = true
-			item.Reason = "failed"
-		case !isTerminalState(task.State) && age >= agingThreshold:
-			item.NeedsAction = true
-			item.Reason = "aging"
-		}
-		if item.NeedsAction {
-			dashboard.Tasks = append(dashboard.Tasks, item)
-		}
-	}
-	return dashboard, nil
 }
 func (s *Service) Trace(ctx context.Context, id string) ([]model.Event, error) {
 	return s.store.Events(ctx, id)
@@ -291,60 +183,6 @@ func (s *Service) DeleteMemory(ctx context.Context, repository, key string) erro
 		return err
 	}
 	return s.store.ApplyMemory(ctx, repository, "", model.MemoryUpdate{Delete: []string{key}}, s.now().UTC())
-}
-
-func (s *Service) CancelTask(ctx context.Context, id, actor, reason, idempotencyKey string) (*model.Task, error) {
-	actor = strings.TrimSpace(actor)
-	if actor == "" {
-		actor = "user"
-	}
-	if actor != "user" && actor != "coordinator" {
-		return nil, fmt.Errorf("%w: %s cannot cancel tasks", ErrAccessDenied, actor)
-	}
-	task, err := s.store.Task(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if idempotencyKey != "" {
-		events, err := s.store.Events(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		for _, event := range events {
-			if event.Data != nil && event.Data["idempotency_key"] == idempotencyKey {
-				return task, nil
-			}
-		}
-	}
-	if isTerminalState(task.State) {
-		return task, nil
-	}
-	at := s.now().UTC()
-	data := map[string]any{"from": task.State, "to": model.TaskCancelled}
-	if reason != "" {
-		data["reason"] = reason
-	}
-	if idempotencyKey != "" {
-		data["idempotency_key"] = idempotencyKey
-	}
-	summary := "task cancelled"
-	if reason != "" {
-		summary += ": " + reason
-	}
-	if err := s.store.Transition(ctx, id, task.State, model.TaskCancelled, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: at}); err != nil {
-		return nil, err
-	}
-	updated, err := s.store.Task(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := recordArtifactTransition(*updated, model.TaskCancelled, summary, at); err != nil {
-		return nil, err
-	}
-	if err := recordArtifactCancellation(*updated, actor, reason, idempotencyKey, at); err != nil {
-		return nil, err
-	}
-	return updated, nil
 }
 
 // Route evaluates candidate agents based on token availability, capability fit,
@@ -415,82 +253,6 @@ func (s *Service) Route(ctx context.Context, taskID, role, objective string, ada
 	return decision, nil
 }
 
-// Plan asks an agent for an implementation plan without allowing it to edit
-// the workspace. The plan is recorded as a normal run and can be passed to an
-// executor by ExecuteWithPlan.
-func (s *Service) Plan(ctx context.Context, task *model.Task, adapter agents.Adapter, selectedModel string, emit func(agents.Event)) (*PlanResult, error) {
-	installation := adapter.Detect(ctx)
-	if !installation.Available {
-		summary := fmt.Sprintf("%s adapter unavailable", adapter.Name())
-		if installation.Error != "" {
-			summary += ": " + installation.Error
-		}
-		_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.unavailable", Actor: "coordinator", Summary: summary, CreatedAt: s.now().UTC()})
-		return nil, fmt.Errorf("%w: %s", ErrAgentUnavailable, summary)
-	}
-	memory, err := s.store.ProjectMemory(ctx, task.Repository)
-	if err != nil {
-		return nil, fmt.Errorf("load project memory: %w", err)
-	}
-	started := s.now().UTC()
-	_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "planning.started", Actor: adapter.Name(), Summary: fmt.Sprintf("planner → %s", adapter.Name()), Data: map[string]any{"adapter": adapter.Name(), "version": installation.Version}, CreatedAt: started})
-	request := agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: selectedModel, Sandbox: agents.SandboxReadOnly}
-	run, err := adapter.Start(ctx, request)
-	if err != nil {
-		completed := s.now().UTC()
-		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
-		_ = recordArtifactProviderAttempt(*task, "planner", adapter.Name(), selectedModel, "FAILED", result, started, completed, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
-		return nil, err
-	}
-	for event := range run.Events() {
-		if emit != nil {
-			if agentTextEvent(event.Kind) {
-				event.Message, _ = parseMemoryUpdate(event.Message)
-			}
-			emit(event)
-		}
-		if event.Kind == agents.EventSession {
-			_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.session_started", Actor: adapter.Name(), Summary: "session " + event.SessionID + " started", Data: map[string]any{"session_id": event.SessionID, "role": "planner"}, CreatedAt: s.now().UTC()})
-		}
-		if event.Kind == agents.EventError {
-			_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "agent.error", Actor: adapter.Name(), Summary: event.Message, CreatedAt: s.now().UTC()})
-		}
-	}
-	result := run.Wait()
-	cleanResponse, _ := parseMemoryUpdate(result.Response)
-	result.Response = cleanResponse
-	completed := s.now().UTC()
-	status := "COMPLETED"
-	if result.Err != nil {
-		status = "FAILED"
-	}
-	if err := recordArtifactProviderAttempt(*task, "planner", adapter.Name(), selectedModel, status, result, started, completed, errorDetailFromResult(result), tracePathsForResult(adapter.Name(), result)); err != nil {
-		return nil, err
-	}
-	if err := s.store.RecordRun(ctx, model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}, task.Repository); err != nil {
-		return nil, err
-	}
-	if err := recordArtifactAgentResult(*task, "planner", adapter.Name(), status, result, started, completed, nil); err != nil {
-		return nil, err
-	}
-	if result.Err != nil {
-		if IsQuotaExhausted(result.Err) {
-			_ = s.store.AppendEvent(ctx, model.Event{
-				ID:        newID("evt"),
-				TaskID:    task.ID,
-				Type:      "agent.quota_exhausted",
-				Actor:     adapter.Name(),
-				Summary:   fmt.Sprintf("%s token quota exhausted: %s", adapter.Name(), result.Err.Error()),
-				Data:      map[string]any{"adapter": adapter.Name(), "error": result.Err.Error()},
-				CreatedAt: s.now().UTC(),
-			})
-		}
-		_ = s.transition(ctx, task.ID, model.TaskPlanning, model.TaskFailed, adapter.Name(), "planner failed: "+result.Err.Error(), nil)
-		return &PlanResult{Task: task, Result: result}, result.Err
-	}
-	return &PlanResult{Task: task, Result: result}, nil
-}
-
 // ExecuteWithPlan builds a two-agent orchestration graph: a read-only planner
 // produces context, then a workspace-writing executor consumes it.
 func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner, executor agents.Adapter, plannerModel string, request agents.Request, emitPlan, emitExecution func(agents.Event)) (*Execution, error) {
@@ -516,9 +278,6 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 	if err != nil {
 		return nil, fmt.Errorf("load project memory: %w", err)
 	}
-	if err := recordArtifactCostLimit(*task, request.MaxTotalTokens); err != nil {
-		return nil, err
-	}
 
 	_ = s.store.AppendEvent(ctx, model.Event{ID: newID("evt"), TaskID: task.ID, Type: "planning.started", Actor: planner.Name(), Summary: fmt.Sprintf("planner → %s", planner.Name()), Data: map[string]any{"adapter": planner.Name(), "model": plannerModel, "version": plannerInstallation.Version, "role": "planner"}, CreatedAt: s.now().UTC()})
 	currentTask, err := s.store.Task(ctx, task.ID)
@@ -542,17 +301,13 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 		{ID: "plan", Agent: "planner", Request: agents.Request{Prompt: composePlanPrompt(task.Objective, memory), Workspace: task.Repository, Model: plannerModel, Sandbox: agents.SandboxReadOnly}, ReadOnly: true},
 		{ID: "execute", Agent: "executor", Request: request, DependsOn: []string{"plan"}, ReadOnly: false},
 	}
-	decision := AssessDurableOrchestration(agentTasks, semanticDurableHints(AnalyzeObjective(RoleImplementation, task.Objective)))
-	if err := s.recordOrchestrationDecision(ctx, *task, decision); err != nil {
-		return nil, err
-	}
+	var latestExecutionResult string
 	orchestrator := Orchestrator{
 		Adapters: map[string]agents.Adapter{
 			"planner":  sanitizedPlannerAdapter{Adapter: planner},
 			"executor": executor,
 		},
-		Mode:        ExecutionSequential,
-		TokenBudget: TokenBudget{MaxTotalTokens: request.MaxTotalTokens},
+		Mode: ExecutionSequential,
 		OnEvent: func(agentTask AgentTask, event agents.Event) {
 			if agentTask.ID == "plan" {
 				if agentTextEvent(event.Kind) {
@@ -571,6 +326,9 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 			}
 			if agentTextEvent(event.Kind) {
 				event.Message, _ = parseMemoryUpdate(event.Message)
+			}
+			if event.Kind == agents.EventResult && strings.TrimSpace(event.Message) != "" {
+				latestExecutionResult = strings.TrimSpace(event.Message)
 			}
 			if emitExecution != nil {
 				emitExecution(event)
@@ -612,6 +370,9 @@ func (s *Service) ExecuteWithPlan(ctx context.Context, task *model.Task, planner
 		}
 		s.failExecution(ctx, task.ID, executor.Name(), runErr)
 		return nil, runErr
+	}
+	if strings.TrimSpace(execResult.Result.Response) == "" && latestExecutionResult != "" {
+		execResult.Result.Response = latestExecutionResult
 	}
 	cleanResponse, memoryUpdate := parseMemoryUpdate(execResult.Result.Response)
 	execResult.Result.Response = cleanResponse
@@ -674,25 +435,11 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	if err := s.transition(ctx, task.ID, fromState, model.TaskRunning, "router", fmt.Sprintf("implementer → %s", adapter.Name()), map[string]any{"adapter": adapter.Name(), "version": installation.Version}); err != nil {
 		return nil, err
 	}
-	if err := s.recordOrchestrationDecision(ctx, *task, localOrchestrationDecision()); err != nil {
-		return nil, err
-	}
 	objective := task.Objective
 	if strings.TrimSpace(request.Prompt) != "" {
 		objective = request.Prompt
 	}
 	request.Prompt = composePrompt(objective, memory)
-	if err := recordArtifactCostLimit(*task, request.MaxTotalTokens); err != nil {
-		return nil, err
-	}
-	if request.MaxTotalTokens > 0 && estimatePromptUsage(request.Prompt).TotalTokens > request.MaxTotalTokens {
-		err := fmt.Errorf("%w: estimated prompt tokens exceed max_total_tokens", ErrCostLimitExceeded)
-		at := s.now().UTC()
-		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
-		_ = recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, "FAILED", result, started, at, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
-		s.failExecution(ctx, task.ID, adapter.Name(), err)
-		return nil, err
-	}
 	if adapter.Name() == "freebuff" {
 		request.Prompt += DelegationInstructions()
 	}
@@ -700,17 +447,18 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 	beforeWorkspace, canCheckWorkspace := workspaceStatus(ctx, task.Repository)
 	run, err := adapter.Start(ctx, request)
 	if err != nil {
-		completed := s.now().UTC()
-		result := agents.Result{ExitCode: -1, Error: err.Error(), Err: err}
-		_ = recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, "FAILED", result, started, completed, errorDetailFromError(err), tracePathsForResult(adapter.Name(), result))
 		s.failExecution(ctx, task.ID, adapter.Name(), err)
 		return nil, err
 	}
+	var latestResultEvent string
 	for event := range run.Events() {
+		if agentTextEvent(event.Kind) {
+			event.Message, _ = parseMemoryUpdate(event.Message)
+		}
+		if event.Kind == agents.EventResult && strings.TrimSpace(event.Message) != "" {
+			latestResultEvent = strings.TrimSpace(event.Message)
+		}
 		if emit != nil {
-			if agentTextEvent(event.Kind) {
-				event.Message, _ = parseMemoryUpdate(event.Message)
-			}
 			emit(event)
 		}
 		switch event.Kind {
@@ -721,6 +469,9 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 		}
 	}
 	result := run.Wait()
+	if strings.TrimSpace(result.Response) == "" && latestResultEvent != "" {
+		result.Response = latestResultEvent
+	}
 	if result.Err == nil && canCheckWorkspace && request.Sandbox == agents.SandboxWorkspaceWrite {
 		afterWorkspace, afterOK := workspaceStatus(ctx, task.Repository)
 		semanticProfile := AnalyzeObjective(RoleImplementation, task.Objective)
@@ -751,14 +502,8 @@ func (s *Service) Execute(ctx context.Context, task *model.Task, adapter agents.
 			})
 		}
 	}
-	if err := recordArtifactProviderAttempt(*task, "implementer", adapter.Name(), request.Model, status, result, started, completed, errorDetailFromResult(result), tracePathsForResult(adapter.Name(), result)); err != nil {
-		return nil, err
-	}
 	record := model.RunRecord{ID: newID("run"), TaskID: task.ID, Adapter: adapter.Name(), SessionID: result.SessionID, Status: status, ExitCode: result.ExitCode, Response: result.Response, Usage: map[string]any{"input_tokens": result.Usage.InputTokens, "cached_tokens": result.Usage.CachedTokens, "output_tokens": result.Usage.OutputTokens, "reasoning_tokens": result.Usage.ReasoningTokens, "total_tokens": result.Usage.TotalTokens}, StartedAt: started, CompletedAt: completed}
 	if err := s.store.RecordRun(ctx, record, task.Repository); err != nil {
-		return nil, err
-	}
-	if err := recordArtifactAgentResult(*task, "implementer", adapter.Name(), status, result, started, completed, nil); err != nil {
 		return nil, err
 	}
 	if result.Err == nil && (len(memoryUpdate.Upsert) > 0 || len(memoryUpdate.Delete) > 0) {
@@ -914,10 +659,7 @@ func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, role, ad
 	if result.Result.Err != nil || result.Error != "" || result.Skipped {
 		status = "FAILED"
 	}
-	if err := recordArtifactProviderAttempt(*task, role, adapter, result.Model, status, result.Result, result.StartedAt, result.CompletedAt, errorDetailFromResult(result.Result), tracePathsForResult(adapter, result.Result)); err != nil {
-		return err
-	}
-	if err := s.store.RecordRun(ctx, model.RunRecord{
+	return s.store.RecordRun(ctx, model.RunRecord{
 		ID:          newID("run"),
 		TaskID:      task.ID,
 		Adapter:     adapter,
@@ -928,75 +670,7 @@ func (s *Service) recordAgentRun(ctx context.Context, task *model.Task, role, ad
 		Usage:       map[string]any{"input_tokens": result.Result.Usage.InputTokens, "cached_tokens": result.Result.Usage.CachedTokens, "output_tokens": result.Result.Usage.OutputTokens, "reasoning_tokens": result.Result.Usage.ReasoningTokens, "total_tokens": result.Result.Usage.TotalTokens},
 		StartedAt:   result.StartedAt,
 		CompletedAt: result.CompletedAt,
-	}, task.Repository); err != nil {
-		return err
-	}
-	return recordArtifactAgentResult(*task, role, adapter, status, result.Result, result.StartedAt, result.CompletedAt, map[string]any{"orchestrator_task_id": result.TaskID, "skipped": result.Skipped})
-}
-
-func errorDetailFromResult(result agents.Result) map[string]any {
-	if result.Err == nil && result.Error == "" && result.ExitCode == 0 {
-		return nil
-	}
-	detail := map[string]any{"exit_code": result.ExitCode}
-	if result.Error != "" {
-		detail["message"] = result.Error
-	}
-	if result.Err != nil {
-		detail["type"] = fmt.Sprintf("%T", result.Err)
-		detail["cause"] = result.Err.Error()
-	}
-	if result.SessionID != "" {
-		detail["session_id"] = result.SessionID
-	}
-	return detail
-}
-
-func errorDetailFromError(err error) map[string]any {
-	if err == nil {
-		return nil
-	}
-	return map[string]any{
-		"exit_code": -1,
-		"type":      fmt.Sprintf("%T", err),
-		"cause":     err.Error(),
-	}
-}
-
-func tracePathsForResult(adapter string, result agents.Result) []string {
-	if adapter != "freebuff" || !strings.HasPrefix(result.SessionID, "freebuff:") {
-		return nil
-	}
-	dir := strings.TrimPrefix(result.SessionID, "freebuff:")
-	if strings.TrimSpace(dir) == "" {
-		return nil
-	}
-	return []string{
-		filepath.Join(dir, "status.md"),
-		filepath.Join(dir, "result.md"),
-		filepath.Join(dir, "trace.log"),
-	}
-}
-
-func (s *Service) recordOrchestrationDecision(ctx context.Context, task model.Task, decision DurableOrchestrationDecision) error {
-	if err := recordArtifactOrchestrationDecision(task, decision); err != nil {
-		return err
-	}
-	_ = s.store.AppendEvent(ctx, model.Event{
-		ID:      newID("evt"),
-		TaskID:  task.ID,
-		Type:    "orchestration.selected",
-		Actor:   "orchestrator",
-		Summary: fmt.Sprintf("orchestration backend selected: %s", decision.Backend),
-		Data: map[string]any{
-			"backend":      decision.Backend,
-			"durable":      decision.Durable,
-			"reasons":      decision.Reasons,
-			"requirements": decision.Requirements,
-		},
-		CreatedAt: s.now().UTC(),
-	})
-	return nil
+	}, task.Repository)
 }
 
 type sanitizedPlannerAdapter struct {
@@ -1038,14 +712,7 @@ func (r sanitizedPlannerRun) Wait() agents.Result {
 
 func (s *Service) transition(ctx context.Context, id string, from, to model.TaskState, actor, summary string, data map[string]any) error {
 	at := s.now().UTC()
-	if err := s.store.Transition(ctx, id, from, to, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: at}); err != nil {
-		return err
-	}
-	task, err := s.store.Task(ctx, id)
-	if err != nil {
-		return err
-	}
-	return recordArtifactTransition(*task, to, summary, at)
+	return s.store.Transition(ctx, id, from, to, model.Event{ID: newID("evt"), TaskID: id, Type: "task.state_changed", Actor: actor, Summary: summary, Data: data, CreatedAt: at})
 }
 func (s *Service) failExecution(ctx context.Context, id, actor string, cause error) {
 	_ = s.transition(ctx, id, model.TaskRunning, model.TaskFailed, actor, "agent failed to start: "+cause.Error(), nil)

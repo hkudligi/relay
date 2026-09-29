@@ -56,7 +56,6 @@ type OrchestrationResult struct {
 	Messages   []AgentMessage          `json:"messages,omitempty"`
 	Usage      agents.Usage            `json:"usage,omitempty"`
 	AgentUsage map[string]agents.Usage `json:"agent_usage,omitempty"`
-	Budget     *TokenBudgetSnapshot    `json:"budget,omitempty"`
 }
 
 // AgentMessage is the bounded handoff text shared from one completed task to a
@@ -76,18 +75,6 @@ type CommunicationPolicy struct {
 	MaxBytesPerDependency    int
 }
 
-type TokenBudget struct {
-	MaxTotalTokens    int64
-	MaxTokensPerAgent map[string]int64
-}
-
-type TokenBudgetSnapshot struct {
-	MaxTotalTokens    int64            `json:"max_total_tokens,omitempty"`
-	MaxTokensPerAgent map[string]int64 `json:"max_tokens_per_agent,omitempty"`
-	UsedTotalTokens   int64            `json:"used_total_tokens,omitempty"`
-	UsedByAgent       map[string]int64 `json:"used_by_agent,omitempty"`
-}
-
 // EventSink receives events from each process. It is called synchronously per
 // event, so callers that do I/O should return quickly.
 type EventSink func(task AgentTask, event agents.Event)
@@ -101,7 +88,6 @@ type Orchestrator struct {
 	MaxParallel   int
 	OnEvent       EventSink
 	Communication CommunicationPolicy
-	TokenBudget   TokenBudget
 }
 
 var (
@@ -131,7 +117,6 @@ func (o Orchestrator) Run(ctx context.Context, tasks []AgentTask) (Orchestration
 	completed := make(map[string]bool, len(tasks))
 	results := make(map[string]AgentTaskResult, len(tasks))
 	messages := make([]AgentMessage, 0, len(tasks))
-	ledger := newTokenLedger(o.TokenBudget)
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -150,35 +135,26 @@ func (o Orchestrator) Run(ctx context.Context, tasks []AgentTask) (Orchestration
 		}
 		ready := readyTasks(tasks, completed, results)
 		if len(ready) == 0 {
-			return o.result(mode, tasks, results, messages, ledger), fmt.Errorf("%w: dependency cycle or unresolved dependency", ErrInvalidOrchestration)
+			return o.result(mode, tasks, results, messages), fmt.Errorf("%w: dependency cycle or unresolved dependency", ErrInvalidOrchestration)
 		}
 
-		batch := chooseBatch(ready, mode, limit)
-		prepared, handoffs, skipped, budgetFailed := o.prepareBatch(batch, results, ledger)
-		for _, result := range skipped {
-			results[result.TaskID] = result
-			completed[result.TaskID] = true
-		}
+		batch := o.chooseBatch(ready, mode, limit)
+		prepared, handoffs := o.prepareBatch(batch, results)
 		messages = append(messages, handoffs...)
-		if budgetFailed {
-			cancel()
-			return o.result(mode, tasks, results, messages, ledger), fmt.Errorf("%w: token budget exhausted", ErrOrchestrationFailed)
-		}
 		if len(prepared) == 0 {
 			continue
 		}
 		batchResults, failed := o.runBatch(childCtx, prepared)
 		for _, result := range batchResults {
-			ledger.add(result.Agent, result.Result.Usage)
 			results[result.TaskID] = result
 			completed[result.TaskID] = true
 		}
 		if failed {
 			cancel()
-			return o.result(mode, tasks, results, messages, ledger), fmt.Errorf("%w: one or more agent tasks failed", ErrOrchestrationFailed)
+			return o.result(mode, tasks, results, messages), fmt.Errorf("%w: one or more agent tasks failed", ErrOrchestrationFailed)
 		}
 	}
-	return o.result(mode, tasks, results, messages, ledger), nil
+	return o.result(mode, tasks, results, messages), nil
 }
 
 func validateTasks(tasks []AgentTask, adapters map[string]agents.Adapter) error {
@@ -234,27 +210,90 @@ func readyTasks(tasks []AgentTask, completed map[string]bool, results map[string
 	return ready
 }
 
-func chooseBatch(ready []AgentTask, mode ExecutionMode, limit int) []AgentTask {
+// chooseBatch selects the next set of tasks to launch together. The scheduler
+// keeps tasks on single-session adapters (e.g. freebuff) out of the same
+// batch: their provider permits one active session per account, so two roles
+// routed to the same adapter must reuse that session in later rounds instead
+// of racing the vendor's instance lock.
+func (o Orchestrator) chooseBatch(ready []AgentTask, mode ExecutionMode, limit int) []AgentTask {
 	sort.Slice(ready, func(i, j int) bool { return ready[i].ID < ready[j].ID })
 	if mode == ExecutionSequential {
 		return ready[:1]
 	}
+	// Two tasks on the same single-session adapter would fight over the one
+	// permitted account session. Keep only the first such task; the rest stay
+	// ready and enter a later batch once the session is free again.
+	if o.hasSingleSessionConflict(ready) {
+		return o.tasksUpToFirstSingleSession(ready, limit)
+	}
 	// Parallel and auto modes fan out independent read-only work. Mutating
 	// tasks may also fan out when every task explicitly opts in and declares
 	// disjoint workspace ownership.
-	for _, task := range ready {
+	batch := ready[:min(limit, len(ready))]
+	for _, task := range batch {
 		if !task.ReadOnly && !task.ParallelSafe {
 			return []AgentTask{task}
 		}
 	}
-	if hasMutatingTask(ready) && !disjointOwnership(ready) {
-		for _, task := range ready {
+	if hasMutatingTask(batch) && !disjointOwnership(batch) {
+		for _, task := range batch {
 			if !task.ReadOnly {
 				return []AgentTask{task}
 			}
 		}
 	}
-	return ready[:min(limit, len(ready))]
+	return batch
+}
+
+// isSingleSessionAgent reports whether the task's adapter permits only one
+// active session per account (freebuff does; its user-scoped lock fails fast
+// with a session-conflict error when two runs race concurrently).
+func (o Orchestrator) isSingleSessionAgent(agent string) bool {
+	adapter, ok := o.Adapters[agent]
+	if !ok {
+		return false
+	}
+	return adapter.Capabilities().SingleSession
+}
+
+// hasSingleSessionConflict reports whether the ready list contains two or
+// more tasks bound for the same single-session adapter.
+func (o Orchestrator) hasSingleSessionConflict(ready []AgentTask) bool {
+	counts := make(map[string]int, len(ready))
+	for _, task := range ready {
+		if o.isSingleSessionAgent(task.Agent) {
+			counts[task.Agent]++
+			if counts[task.Agent] > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// tasksUpToFirstSingleSession builds the batch with at most one task per
+// single-session adapter. Other ready tasks before it still fit in the batch
+// and run concurrently with it; the remaining single-session tasks wait for
+// the next scheduling round, reusing the one account session sequentially.
+func (o Orchestrator) tasksUpToFirstSingleSession(ready []AgentTask, limit int) []AgentTask {
+	seen := make(map[string]bool, len(ready))
+	batch := make([]AgentTask, 0, len(ready))
+	for _, task := range ready {
+		if o.isSingleSessionAgent(task.Agent) {
+			if seen[task.Agent] {
+				continue
+			}
+			seen[task.Agent] = true
+		}
+		if len(batch) >= limit {
+			break
+		}
+		batch = append(batch, task)
+	}
+	if len(batch) == 0 && len(ready) > 0 {
+		batch = append(batch, ready[0])
+	}
+	return batch
 }
 
 func hasMutatingTask(tasks []AgentTask) bool {
@@ -338,25 +377,16 @@ func (o Orchestrator) runBatch(ctx context.Context, tasks []AgentTask) ([]AgentT
 	return results, failed
 }
 
-func (o Orchestrator) prepareBatch(tasks []AgentTask, results map[string]AgentTaskResult, ledger *tokenLedger) ([]AgentTask, []AgentMessage, []AgentTaskResult, bool) {
+func (o Orchestrator) prepareBatch(tasks []AgentTask, results map[string]AgentTaskResult) ([]AgentTask, []AgentMessage) {
 	prepared := make([]AgentTask, 0, len(tasks))
 	var messages []AgentMessage
-	var skipped []AgentTaskResult
-	trial := ledger.clone()
 	for _, task := range tasks {
 		next, handoffs := o.attachDependencyContext(task, results)
-		promptUsage := estimatePromptUsage(next.Request.Prompt)
-		if err := trial.canSpend(task.Agent, promptUsage); err != nil {
-			skipped = append(skipped, AgentTaskResult{TaskID: task.ID, Agent: task.Agent, PromptUsage: promptUsage, Skipped: true, Error: err.Error(), StartedAt: time.Now().UTC(), CompletedAt: time.Now().UTC()})
-			return nil, nil, skipped, true
-		}
-		trial.add(task.Agent, promptUsage)
 		next.Request.Model = agents.ExecutionModel(next.Request.Model)
 		prepared = append(prepared, next)
 		messages = append(messages, handoffs...)
 	}
-	*ledger = *trial
-	return prepared, messages, skipped, false
+	return prepared, messages
 }
 
 func (o Orchestrator) attachDependencyContext(task AgentTask, results map[string]AgentTaskResult) (AgentTask, []AgentMessage) {
@@ -409,78 +439,24 @@ func estimatePromptUsage(prompt string) agents.Usage {
 	return agents.Usage{InputTokens: tokens, TotalTokens: tokens}
 }
 
-func (o Orchestrator) result(mode ExecutionMode, tasks []AgentTask, results map[string]AgentTaskResult, messages []AgentMessage, ledger *tokenLedger) OrchestrationResult {
+func (o Orchestrator) result(mode ExecutionMode, tasks []AgentTask, results map[string]AgentTaskResult, messages []AgentMessage) OrchestrationResult {
+	ordered := orderedResults(tasks, results)
+	var total agents.Usage
+	byAgent := make(map[string]agents.Usage)
+	for _, result := range ordered {
+		total = addUsage(total, result.Result.Usage)
+		byAgent[result.Agent] = addUsage(byAgent[result.Agent], result.Result.Usage)
+	}
+	if len(byAgent) == 0 {
+		byAgent = nil
+	}
 	return OrchestrationResult{
 		Mode:       mode,
-		Results:    orderedResults(tasks, results),
+		Results:    ordered,
 		Messages:   messages,
-		Usage:      ledger.totalUsage,
-		AgentUsage: ledger.agentUsage,
-		Budget:     ledger.snapshot(),
+		Usage:      total,
+		AgentUsage: byAgent,
 	}
-}
-
-type tokenLedger struct {
-	budget      TokenBudget
-	totalUsage  agents.Usage
-	agentUsage  map[string]agents.Usage
-	usedByAgent map[string]int64
-}
-
-func newTokenLedger(budget TokenBudget) *tokenLedger {
-	return &tokenLedger{budget: budget, agentUsage: make(map[string]agents.Usage), usedByAgent: make(map[string]int64)}
-}
-
-func (l *tokenLedger) clone() *tokenLedger {
-	next := &tokenLedger{
-		budget:      l.budget,
-		totalUsage:  l.totalUsage,
-		agentUsage:  make(map[string]agents.Usage, len(l.agentUsage)),
-		usedByAgent: make(map[string]int64, len(l.usedByAgent)),
-	}
-	for agent, usage := range l.agentUsage {
-		next.agentUsage[agent] = usage
-	}
-	for agent, used := range l.usedByAgent {
-		next.usedByAgent[agent] = used
-	}
-	return next
-}
-
-func (l *tokenLedger) canSpend(agent string, usage agents.Usage) error {
-	tokens := usage.TotalTokens
-	if tokens <= 0 {
-		return nil
-	}
-	if l.budget.MaxTotalTokens > 0 && l.totalUsage.TotalTokens+tokens > l.budget.MaxTotalTokens {
-		return fmt.Errorf("total token budget exceeded")
-	}
-	if l.budget.MaxTokensPerAgent != nil && l.budget.MaxTokensPerAgent[agent] > 0 && l.usedByAgent[agent]+tokens > l.budget.MaxTokensPerAgent[agent] {
-		return fmt.Errorf("%s token budget exceeded", agent)
-	}
-	return nil
-}
-
-func (l *tokenLedger) add(agent string, usage agents.Usage) {
-	l.totalUsage = addUsage(l.totalUsage, usage)
-	current := l.agentUsage[agent]
-	l.agentUsage[agent] = addUsage(current, usage)
-	l.usedByAgent[agent] += usage.TotalTokens
-}
-
-func (l *tokenLedger) snapshot() *TokenBudgetSnapshot {
-	if l.budget.MaxTotalTokens <= 0 && len(l.budget.MaxTokensPerAgent) == 0 {
-		return nil
-	}
-	maxByAgent := make(map[string]int64, len(l.budget.MaxTokensPerAgent))
-	for agent, max := range l.budget.MaxTokensPerAgent {
-		maxByAgent[agent] = max
-	}
-	usedByAgent := make(map[string]int64, len(l.usedByAgent))
-	for agent, used := range l.usedByAgent {
-		usedByAgent[agent] = used
-	}
-	return &TokenBudgetSnapshot{MaxTotalTokens: l.budget.MaxTotalTokens, MaxTokensPerAgent: maxByAgent, UsedTotalTokens: l.totalUsage.TotalTokens, UsedByAgent: usedByAgent}
 }
 
 func addUsage(a, b agents.Usage) agents.Usage {

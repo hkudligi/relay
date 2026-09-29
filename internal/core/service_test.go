@@ -2,9 +2,8 @@ package core_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +73,30 @@ func (a *memoryAdapter) Start(_ context.Context, request agents.Request) (agents
 	return &fakeRun{events: events, done: done}, nil
 }
 func (a *memoryAdapter) Resume(context.Context, string, agents.Request) (agents.Run, error) {
+	return nil, nil
+}
+
+type eventResultOnlyAdapter struct {
+	response string
+}
+
+func (a eventResultOnlyAdapter) Name() string { return "event-result-only" }
+func (a eventResultOnlyAdapter) Detect(context.Context) agents.Installation {
+	return agents.Installation{Name: a.Name(), Available: true, Version: "1.0"}
+}
+func (a eventResultOnlyAdapter) Capabilities() agents.Capabilities {
+	return agents.Capabilities{NonInteractive: true}
+}
+func (a eventResultOnlyAdapter) Start(context.Context, agents.Request) (agents.Run, error) {
+	events := make(chan agents.Event, 1)
+	events <- agents.Event{Kind: agents.EventResult, Type: "result.md", Message: a.response}
+	close(events)
+	done := make(chan agents.Result, 1)
+	done <- agents.Result{ExitCode: 0}
+	close(done)
+	return &fakeRun{events: events, done: done}, nil
+}
+func (a eventResultOnlyAdapter) Resume(context.Context, string, agents.Request) (agents.Run, error) {
 	return nil, nil
 }
 
@@ -156,368 +179,7 @@ func TestStartTaskWithInventoryRecordsDiscoveryBeforePlanning(t *testing.T) {
 	}
 }
 
-func TestStartTaskInitializesArtifactWorkspace(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := t.TempDir()
-	task, err := core.New(db).StartTask(context.Background(), repo, "fix the resumable workflow")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := filepath.Join(repo, ".relay", "tasks", task.ID)
-	for _, name := range []string{
-		"objective.md",
-		"plan.md",
-		"state.json",
-		"decisions.md",
-		"findings.md",
-		"progress.md",
-		"questions.md",
-		"evidence",
-		"handoffs",
-	} {
-		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
-			t.Fatalf("missing artifact %s: %v", name, err)
-		}
-	}
-	raw, err := os.ReadFile(filepath.Join(root, "state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var state struct {
-		SchemaVersion int             `json:"schema_version"`
-		TaskID        string          `json:"task_id"`
-		Objective     string          `json:"objective"`
-		Repository    string          `json:"repository"`
-		Phase         model.TaskState `json:"phase"`
-		Status        model.TaskState `json:"status"`
-		Orchestration struct {
-			Backend string `json:"backend"`
-			Durable bool   `json:"durable"`
-		} `json:"orchestration"`
-		CompletionGates []struct {
-			ID        string `json:"id"`
-			Required  bool   `json:"required"`
-			Satisfied bool   `json:"satisfied"`
-		} `json:"completion_gates"`
-		RetryLimits map[string]struct {
-			MaxAttempts int `json:"max_attempts"`
-			Attempts    int `json:"attempts"`
-		} `json:"retry_limits"`
-		AgentResults []struct{} `json:"agent_results"`
-		Operations   struct {
-			AccessControls struct {
-				AllowedCancellationActors []string `json:"allowed_cancellation_actors"`
-			} `json:"access_controls"`
-		} `json:"operations"`
-	}
-	if err := json.Unmarshal(raw, &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.TaskID != task.ID || state.Objective != task.Objective || state.Repository != repo || state.Phase != model.TaskPlanning || state.Status != model.TaskPlanning {
-		t.Fatalf("state artifact = %+v, task = %+v", state, task)
-	}
-	if state.SchemaVersion != 3 {
-		t.Fatalf("schema_version = %d, want 3", state.SchemaVersion)
-	}
-	if state.Orchestration.Backend != "local" || state.Orchestration.Durable {
-		t.Fatalf("orchestration = %+v", state.Orchestration)
-	}
-	if len(state.CompletionGates) < 4 || state.CompletionGates[0].ID != "objective_recorded" || !state.CompletionGates[0].Satisfied {
-		t.Fatalf("completion gates = %+v", state.CompletionGates)
-	}
-	if state.RetryLimits["implementer"].MaxAttempts != 3 || state.RetryLimits["implementer"].Attempts != 0 {
-		t.Fatalf("retry limits = %+v", state.RetryLimits)
-	}
-	if len(state.AgentResults) != 0 {
-		t.Fatalf("agent results should start empty: %+v", state.AgentResults)
-	}
-	if len(state.Operations.AccessControls.AllowedCancellationActors) == 0 {
-		t.Fatalf("operations access controls missing: %+v", state.Operations)
-	}
-	objective, err := os.ReadFile(filepath.Join(root, "objective.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(objective), "fix the resumable workflow") {
-		t.Fatalf("objective artifact = %q", objective)
-	}
-}
-
-func TestOperationsDashboardFlagsFailedBlockedAndAgingTasks(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := "/repo"
-	svc := core.New(db)
-	ctx := context.Background()
-	if _, err := svc.StartTask(ctx, repo, "fresh work"); err != nil {
-		t.Fatal(err)
-	}
-	aged := model.Task{ID: "task-aged", Repository: repo, Objective: "old planning", State: model.TaskPlanning, Version: 1, CreatedAt: time.Now().UTC().Add(-2 * time.Hour), UpdatedAt: time.Now().UTC().Add(-2 * time.Hour)}
-	if err := db.CreateTask(ctx, aged, model.Event{ID: "evt-aged", TaskID: aged.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: aged.Objective, CreatedAt: aged.CreatedAt}); err != nil {
-		t.Fatal(err)
-	}
-	failed := model.Task{ID: "task-failed", Repository: repo, Objective: "failed work", State: model.TaskFailed, Version: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	if err := db.CreateTask(ctx, failed, model.Event{ID: "evt-failed", TaskID: failed.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: failed.Objective, CreatedAt: failed.CreatedAt}); err != nil {
-		t.Fatal(err)
-	}
-
-	dashboard, err := svc.Operations(ctx, repo, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dashboard.Counts[model.TaskPlanning] != 2 || dashboard.Counts[model.TaskFailed] != 1 {
-		t.Fatalf("counts = %+v", dashboard.Counts)
-	}
-	reasons := map[string]string{}
-	for _, item := range dashboard.Tasks {
-		reasons[item.ID] = item.Reason
-	}
-	if reasons["task-aged"] != "aging" || reasons["task-failed"] != "failed" {
-		t.Fatalf("dashboard tasks = %+v", dashboard.Tasks)
-	}
-}
-
-func TestCancelTaskIsIdempotentAndRecordsArtifact(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := t.TempDir()
-	svc := core.New(db)
-	task, err := svc.StartTask(context.Background(), repo, "cancel me")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancelled, err := svc.CancelTask(context.Background(), task.ID, "user", "no longer needed", "cancel-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cancelled.State != model.TaskCancelled {
-		t.Fatalf("state = %s", cancelled.State)
-	}
-	if _, err := svc.CancelTask(context.Background(), task.ID, "user", "no longer needed", "cancel-1"); err != nil {
-		t.Fatal(err)
-	}
-	events, err := svc.Trace(context.Background(), task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cancelEvents int
-	for _, event := range events {
-		if event.Data["idempotency_key"] == "cancel-1" {
-			cancelEvents++
-		}
-	}
-	if cancelEvents != 1 {
-		t.Fatalf("cancel events = %d, events = %+v", cancelEvents, events)
-	}
-	raw, err := os.ReadFile(filepath.Join(repo, ".relay", "tasks", task.ID, "state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var state struct {
-		Status     model.TaskState `json:"status"`
-		Operations struct {
-			Cancellation struct {
-				Requested      bool   `json:"requested"`
-				RequestedBy    string `json:"requested_by"`
-				Reason         string `json:"reason"`
-				IdempotencyKey string `json:"idempotency_key"`
-			} `json:"cancellation"`
-			Idempotency []struct {
-				Operation string `json:"operation"`
-				Key       string `json:"key"`
-			} `json:"idempotency"`
-		} `json:"operations"`
-	}
-	if err := json.Unmarshal(raw, &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.Status != model.TaskCancelled || !state.Operations.Cancellation.Requested || state.Operations.Cancellation.IdempotencyKey != "cancel-1" || len(state.Operations.Idempotency) != 1 {
-		t.Fatalf("state = %+v", state)
-	}
-}
-
-func TestCancelTaskRejectsUnauthorizedActor(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	svc := core.New(db)
-	task, err := svc.StartTask(context.Background(), "/repo", "cancel me")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.CancelTask(context.Background(), task.ID, "adapter", "", ""); !errors.Is(err, core.ErrAccessDenied) {
-		t.Fatalf("err = %v, want ErrAccessDenied", err)
-	}
-}
-
-func TestExecuteHonorsMaxTotalTokens(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := t.TempDir()
-	svc := core.New(db)
-	task, err := svc.StartTask(context.Background(), repo, strings.Repeat("large objective ", 20))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.Execute(context.Background(), task, fakeAdapter{}, agents.Request{MaxTotalTokens: 1}, nil); !errors.Is(err, core.ErrCostLimitExceeded) {
-		t.Fatalf("err = %v, want ErrCostLimitExceeded", err)
-	}
-	raw, err := os.ReadFile(filepath.Join(repo, ".relay", "tasks", task.ID, "state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var state struct {
-		Status     model.TaskState `json:"status"`
-		Operations struct {
-			CostLimits struct {
-				MaxTotalTokens int64 `json:"max_total_tokens"`
-			} `json:"cost_limits"`
-		} `json:"operations"`
-	}
-	if err := json.Unmarshal(raw, &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.Status != model.TaskFailed || state.Operations.CostLimits.MaxTotalTokens != 1 {
-		t.Fatalf("state = %+v", state)
-	}
-}
-
-func TestExecuteUpdatesStageTwoArtifactState(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	repo := t.TempDir()
-	svc := core.New(db)
-	task, err := svc.StartTask(context.Background(), repo, "implement it")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.Execute(context.Background(), task, fakeAdapter{}, agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, nil); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(filepath.Join(repo, ".relay", "tasks", task.ID, "state.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var state struct {
-		Phase                    model.TaskState `json:"phase"`
-		Status                   model.TaskState `json:"status"`
-		LastSuccessfulCheckpoint string          `json:"last_successful_checkpoint"`
-		NextRecommendedAction    string          `json:"next_recommended_action"`
-		CompletionGates          []struct {
-			ID        string `json:"id"`
-			Satisfied bool   `json:"satisfied"`
-			Evidence  string `json:"evidence"`
-		} `json:"completion_gates"`
-		AgentResults []struct {
-			Role      string       `json:"role"`
-			Adapter   string       `json:"adapter"`
-			Status    string       `json:"status"`
-			SessionID string       `json:"session_id"`
-			ExitCode  int          `json:"exit_code"`
-			Usage     agents.Usage `json:"usage"`
-			Summary   string       `json:"summary"`
-		} `json:"agent_results"`
-		ProviderAttempts []struct {
-			Attempt   int    `json:"attempt"`
-			Role      string `json:"role"`
-			Adapter   string `json:"adapter"`
-			Status    string `json:"status"`
-			Model     string `json:"model"`
-			SessionID string `json:"session_id"`
-			ExitCode  int    `json:"exit_code"`
-		} `json:"provider_attempts"`
-	}
-	if err := json.Unmarshal(raw, &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.Phase != model.TaskCompleted || state.Status != model.TaskCompleted || state.LastSuccessfulCheckpoint != "completed" {
-		t.Fatalf("state = %+v", state)
-	}
-	if state.NextRecommendedAction == "" {
-		t.Fatal("next recommended action was not recorded")
-	}
-	gates := map[string]bool{}
-	for _, gate := range state.CompletionGates {
-		gates[gate.ID] = gate.Satisfied
-	}
-	if !gates["agent_result_recorded"] || !gates["terminal_state_recorded"] {
-		t.Fatalf("completion gates = %+v", state.CompletionGates)
-	}
-	if len(state.AgentResults) != 1 {
-		t.Fatalf("agent results = %+v", state.AgentResults)
-	}
-	result := state.AgentResults[0]
-	if result.Role != "implementer" || result.Adapter != "fake" || result.Status != "COMPLETED" || result.SessionID != "session-1" || result.ExitCode != 0 || result.Usage.TotalTokens != 42 || result.Summary != "finished" {
-		t.Fatalf("agent result = %+v", result)
-	}
-	if len(state.ProviderAttempts) != 1 {
-		t.Fatalf("provider attempts = %+v", state.ProviderAttempts)
-	}
-	attempt := state.ProviderAttempts[0]
-	if attempt.Attempt != 1 || attempt.Role != "implementer" || attempt.Adapter != "fake" || attempt.Status != "COMPLETED" || attempt.SessionID != "session-1" || attempt.ExitCode != 0 {
-		t.Fatalf("provider attempt = %+v", attempt)
-	}
-	events, err := svc.Trace(context.Background(), task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var found bool
-	for _, event := range events {
-		if event.Type == "orchestration.selected" {
-			found = true
-			if event.Data["backend"] != "local" || event.Data["durable"] != false {
-				t.Fatalf("orchestration event = %+v", event)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("missing orchestration.selected event: %+v", events)
-	}
-}
-
-func TestAssessDurableOrchestrationRequiresTemporalForStageThreeTriggers(t *testing.T) {
-	decision := core.AssessDurableOrchestration([]core.AgentTask{
-		{ID: "inspect-api", Agent: "fake", ReadOnly: true},
-		{ID: "inspect-ui", Agent: "fake", ReadOnly: true},
-	}, core.DurableOrchestrationHints{LongWait: true, WaitingForUser: true})
-	if decision.Backend != core.OrchestrationBackendTemporal || !decision.Durable {
-		t.Fatalf("decision = %+v", decision)
-	}
-	for _, want := range []string{"parallel branches", "long waits", "human-input signals"} {
-		if !containsRequirement(decision.Requirements, want) {
-			t.Fatalf("requirements = %+v, want %q", decision.Requirements, want)
-		}
-	}
-}
-
-func containsRequirement(items []string, want string) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
-}
-
-func TestFailedExecuteUpdatesRetryAccounting(t *testing.T) {
+func TestFailedExecutePersistsFailedRun(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -533,41 +195,12 @@ func TestFailedExecuteUpdatesRetryAccounting(t *testing.T) {
 	if _, err := svc.Execute(context.Background(), task, adapter, agents.Request{}, nil); err == nil {
 		t.Fatal("expected execution error")
 	}
-	raw, err := os.ReadFile(filepath.Join(repo, ".relay", "tasks", task.ID, "state.json"))
+	status, err := svc.Status(context.Background(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var state struct {
-		Status      model.TaskState `json:"status"`
-		RetryLimits map[string]struct {
-			MaxAttempts int `json:"max_attempts"`
-			Attempts    int `json:"attempts"`
-		} `json:"retry_limits"`
-		AgentResults []struct {
-			Role   string `json:"role"`
-			Status string `json:"status"`
-			Error  string `json:"error"`
-		} `json:"agent_results"`
-		ProviderAttempts []struct {
-			Status string         `json:"status"`
-			Error  string         `json:"error"`
-			Detail map[string]any `json:"error_detail"`
-		} `json:"provider_attempts"`
-	}
-	if err := json.Unmarshal(raw, &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.Status != model.TaskFailed {
-		t.Fatalf("status = %s", state.Status)
-	}
-	if state.RetryLimits["implementer"].Attempts != 1 || state.RetryLimits["implementer"].MaxAttempts != 3 {
-		t.Fatalf("retry limits = %+v", state.RetryLimits)
-	}
-	if len(state.AgentResults) != 1 || state.AgentResults[0].Role != "implementer" || state.AgentResults[0].Status != "FAILED" || state.AgentResults[0].Error != "boom" {
-		t.Fatalf("agent results = %+v", state.AgentResults)
-	}
-	if len(state.ProviderAttempts) != 1 || state.ProviderAttempts[0].Status != "FAILED" || state.ProviderAttempts[0].Error != "boom" || state.ProviderAttempts[0].Detail["cause"] != "boom" {
-		t.Fatalf("provider attempts = %+v", state.ProviderAttempts)
+	if status.Task == nil || status.Task.State != model.TaskFailed {
+		t.Fatalf("status = %+v", status)
 	}
 }
 
@@ -615,8 +248,34 @@ func TestExecutePersistsSessionAndCompletesTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 6 || events[3].Type != "orchestration.selected" {
+	if len(events) != 5 || events[4].Type != "task.state_changed" {
 		t.Fatalf("events = %d: %+v", len(events), events)
+	}
+}
+
+func TestExecuteUsesResultEventWhenWaitResponseIsEmpty(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repo := initGitWorkspace(t)
+	svc := core.New(db)
+	task, err := svc.StartTask(context.Background(), repo, "Give me 200 word essay on perils of AI")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := eventResultOnlyAdapter{response: "AI can help, but it also concentrates power and risk."}
+
+	execution, err := svc.Execute(context.Background(), task, adapter, agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if execution.Task.State != model.TaskCompleted {
+		t.Fatalf("state = %s", execution.Task.State)
+	}
+	if execution.Result.Response != adapter.response {
+		t.Fatalf("response = %q, want streamed result", execution.Result.Response)
 	}
 }
 
@@ -711,7 +370,7 @@ func TestProjectMemoryIsLoadedUpdatedAndDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 6 || events[3].Type != "orchestration.selected" || events[4].Type != "project_memory.updated" {
+	if len(events) != 5 || events[3].Type != "project_memory.updated" {
 		t.Fatalf("events = %+v", events)
 	}
 	nextTask, err := svc.StartTask(context.Background(), "/repo", "use the cache")
@@ -880,4 +539,15 @@ func TestCleanupOldRunsWithRetentionUsesConfiguredPeriod(t *testing.T) {
 	if _, err := svc.Task(ctx, task.ID); err != store.ErrNotFound {
 		t.Fatalf("task err = %v, want ErrNotFound", err)
 	}
+}
+
+func initGitWorkspace(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	cmd := exec.Command("git", "init")
+	cmd.Dir = repo
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	return repo
 }

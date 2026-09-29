@@ -139,53 +139,6 @@ func TestEmptyStatus(t *testing.T) {
 	}
 }
 
-func TestOpsShowsAgingTasks(t *testing.T) {
-	app, out, errOut, dbPath := testApp(t)
-	db, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aged := model.Task{ID: "task-aged", Repository: filepath.Dir(dbPath), Objective: "old work", State: model.TaskPlanning, Version: 1, CreatedAt: time.Now().UTC().Add(-2 * time.Hour), UpdatedAt: time.Now().UTC().Add(-2 * time.Hour)}
-	if err := db.CreateTask(context.Background(), aged, model.Event{ID: "evt-aged", TaskID: aged.ID, Sequence: 1, Type: "task.created", Actor: "user", Summary: aged.Objective, CreatedAt: aged.CreatedAt}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "ops", "--aging", "1h"}); code != cli.ExitOK {
-		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
-	}
-	if !strings.Contains(out.String(), "Needs attention") || !strings.Contains(out.String(), "task-aged") || !strings.Contains(out.String(), "aging") {
-		t.Fatalf("output = %q", out.String())
-	}
-}
-
-func TestCancelCommandIsIdempotent(t *testing.T) {
-	app, out, errOut, dbPath := testApp(t)
-	db, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	svc := core.New(db)
-	task, err := svc.StartTask(context.Background(), filepath.Dir(dbPath), "cancel from cli")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "cancel", "--reason", "superseded", "--idempotency-key", "cli-cancel-1", task.ID}); code != cli.ExitOK {
-		t.Fatalf("exit = %d, stderr = %s", code, errOut.String())
-	}
-	if !strings.Contains(out.String(), string(model.TaskCancelled)) {
-		t.Fatalf("output = %q", out.String())
-	}
-	out.Reset()
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "cancel", "--reason", "superseded", "--idempotency-key", "cli-cancel-1", task.ID}); code != cli.ExitOK {
-		t.Fatalf("second exit = %d, stderr = %s", code, errOut.String())
-	}
-}
-
 func TestMemoryCommands(t *testing.T) {
 	app, out, errOut, db := testApp(t)
 	if code := app.Run(context.Background(), []string{"--state", db, "memory", "set", "build.command", "go", "test", "./..."}); code != cli.ExitOK {
@@ -261,7 +214,7 @@ func TestREPLExecutesObjectiveWithDefaultCodexAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 9 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "semantic.assessed" || events[4].Type != "routing.selected" || events[5].Summary != "implementer → codex" || events[6].Type != "orchestration.selected" || events[8].Type != "task.state_changed" {
+	if len(events) != 8 || events[1].Type != "agent.inventory_discovered" || events[3].Type != "semantic.assessed" || events[4].Type != "routing.selected" || events[5].Summary != "implementer → codex" || events[7].Type != "task.state_changed" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -294,54 +247,6 @@ func TestRunJSONIncludesInventoryAndTrace(t *testing.T) {
 	}
 	if len(events) < 2 || events[1].Type != "agent.inventory_discovered" {
 		t.Fatalf("events = %+v", events)
-	}
-}
-
-func TestCheckpointCommandShowsArtifactState(t *testing.T) {
-	app, out, errOut, dbPath := testApp(t)
-	adapter := &replAdapter{available: true}
-	app.Adapters["codex"] = adapter
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "run", "--json", "implement", "checkpoint"}); code != cli.ExitOK {
-		t.Fatalf("run exit = %d, stderr = %s", code, errOut.String())
-	}
-	var result struct {
-		Execution *core.Execution `json:"execution"`
-	}
-	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
-	if result.Execution == nil {
-		t.Fatalf("run result = %+v", result)
-	}
-	taskID := result.Execution.Task.ID
-
-	out.Reset()
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "checkpoint", taskID}); code != cli.ExitOK {
-		t.Fatalf("checkpoint exit = %d, stderr = %s", code, errOut.String())
-	}
-	got := out.String()
-	for _, want := range []string{"checkpoint: completed", "retry chain:", "provider attempts:", "COMPLETED implementer/codex", "latest result: COMPLETED implementer/codex"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("checkpoint output missing %q:\n%s", want, got)
-		}
-	}
-
-	out.Reset()
-	if code := app.Run(context.Background(), []string{"--state", dbPath, "checkpoint", "--json", taskID}); code != cli.ExitOK {
-		t.Fatalf("checkpoint json exit = %d, stderr = %s", code, errOut.String())
-	}
-	var checkpoint struct {
-		Status           model.TaskState `json:"status"`
-		ProviderAttempts []struct {
-			Adapter string `json:"adapter"`
-			Model   string `json:"model"`
-		} `json:"provider_attempts"`
-	}
-	if err := json.Unmarshal(out.Bytes(), &checkpoint); err != nil {
-		t.Fatal(err)
-	}
-	if checkpoint.Status != model.TaskCompleted || len(checkpoint.ProviderAttempts) != 1 || checkpoint.ProviderAttempts[0].Adapter != "codex" || checkpoint.ProviderAttempts[0].Model != "test-model" {
-		t.Fatalf("checkpoint json = %+v", checkpoint)
 	}
 }
 
@@ -387,10 +292,6 @@ func TestHelpDocumentsRoutingStrategyAndReserveOptions(t *testing.T) {
 		"--min-reserve PCT",
 		"auto-routing skips agents below",
 		"unless no higher-headroom agent is",
-		"--max-total-tokens N",
-		"rly [--state PATH] ops",
-		"rly [--state PATH] cancel",
-		"rly [--state PATH] checkpoint",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("help missing %q:\n%s", want, got)

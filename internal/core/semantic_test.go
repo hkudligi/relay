@@ -56,10 +56,15 @@ func TestLocalSemanticLayerMergesBestExample(t *testing.T) {
 	assertContains(t, profile.Signals, "blocked")
 }
 
-func TestSemanticDurableHintsUsesProfileSignals(t *testing.T) {
-	hints := semanticDurableHints(AnalyzeObjective(RoleImplementation, "detect stalled background workflow retry after process restart with checkpoint resume"))
-	if !hints.ProcessIndependentRetries || !hints.ReliableWorkerRecovery {
-		t.Fatalf("hints = %+v, want durable retry/recovery hints", hints)
+func TestAnalyzeObjectiveDoesNotTreatImplementationRoleAsMutation(t *testing.T) {
+	profile := AnalyzeObjective(RoleImplementation, "Give me 200 word essay on perils of AI")
+	if profile.Mutation {
+		t.Fatalf("Mutation = true for answer-only objective: %+v", profile)
+	}
+	for _, capability := range profile.RequiredCapabilities {
+		if capability == SemanticCapabilityFileEditing {
+			t.Fatalf("RequiredCapabilities = %+v, want no file editing for answer-only objective", profile.RequiredCapabilities)
+		}
 	}
 }
 

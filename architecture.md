@@ -63,8 +63,7 @@ Responsibilities:
 - Provide the interactive repository-aware REPL.
 - Discover installed agents and available models.
 - Start runs and render normalized progress.
-- Expose task, project, trace, checkpoint, memory, operations, cancellation,
-  and resume commands.
+- Expose task, project, trace, memory, and resume commands.
 - Keep machine-readable `--json` output separate from human-readable output.
 
 The current user-facing commands include:
@@ -76,10 +75,7 @@ rly project <project-id>
 rly resume <task-id>
 rly tasks
 rly trace <task-id>
-rly checkpoint <task-id>
 rly status
-rly ops
-rly cancel <task-id>
 rly memory ...
 ```
 
@@ -160,14 +156,17 @@ automatic mode.
 - Read-only independent tasks may run concurrently.
 - Workspace-mutating tasks are serialized unless explicitly declared safe and
   disjoint.
+- Adapters that permit only one active session per account (freebuff declares
+  `SingleSession` in its capabilities) are serialized by the scheduler: when
+  multiple roles such as planner and executor route to the same agent, only
+  one of its tasks enters a batch and the rest reuse the single session in
+  later rounds. Other adapters in the same batch are unaffected.
 - Dependencies are passed through bounded handoff context.
-- Token budgets are checked before launching work.
 - A failed dependency prevents downstream work from starting.
 - Delegated vendor tasks can be launched through the same adapter boundary.
 
-The current durable orchestration metadata describes retry limits, cost
-limits, cancellation, access controls, and idempotency. Execution itself is
-currently local; an external durable workflow engine has not been integrated.
+Execution is local and intentionally small; an external durable workflow engine
+has not been integrated.
 
 ### Agent adapter layer
 
@@ -241,8 +240,7 @@ resume.
 ### Events
 
 Events form an append-only per-task trace. They record transitions, routing,
-inventory discovery, agent sessions, errors, quota failures, memory changes,
-and orchestration decisions.
+inventory discovery, agent sessions, errors, quota failures, and memory changes.
 
 ### Project memory
 
@@ -250,35 +248,6 @@ Memory is repository-scoped durable context containing validated key/value
 facts and decisions. Agents can propose constrained updates through an
 `<rly-memory>` block; Relay validates and applies updates only after a
 successful run.
-
-## Task artifacts
-
-Location: `internal/core/task_artifacts.go`
-
-Each task can have a filesystem artifact workspace containing objective,
-planning, progress, decisions, findings, handoffs, evidence, and machine-
-readable state. The artifact state is currently schema version 3 and includes
-operational metadata for:
-
-- Completion gates.
-- Retry limits and attempts.
-- Token/cost limits.
-- Cancellation and idempotency.
-- Access control.
-- Orchestration backend metadata.
-- Provider/model attempt history, including selected model, session ID, exit
-  code, structured error detail, and relevant Freebuff status/result/trace
-  paths when available.
-- Agent result history.
-
-These artifacts complement SQLite: SQLite is optimized for coordination and
-queries, while artifacts are inspectable handoff material for humans and
-future agent contexts.
-
-`rly checkpoint <task-id>` renders the current artifact state for humans,
-including the latest checkpoint, retry chain, provider attempts, Freebuff run
-directory hints, and latest result summary. `rly checkpoint --json <task-id>`
-returns the raw `state.json` artifact for automation.
 
 ## Execution flows
 
@@ -293,7 +262,7 @@ CLI objective
   -> compose prompt with project memory
   -> start adapter
   -> normalize streamed events
-  -> record provider attempt, run/session/trace, and artifact checkpoint
+  -> record run/session/trace
   -> validate completion
   -> complete, fail, or retry
 ```

@@ -33,8 +33,6 @@ Useful commands:
 ./rly projects
 ./rly project <project-id>
 ./rly resume <task-id>
-./rly ops
-./rly cancel <task-id>
 ./rly memory
 ./rly memory set test.command "go test ./..."
 ./rly memory delete test.command
@@ -52,9 +50,9 @@ subcommand to select another database.
 ## Projects and resumable history
 
 Every task is assigned to a durable project for its repository. A project is
-the long-lived scope around a sequence of task attempts: failed, cancelled,
-and completed tasks remain visible together, while agent sessions remain tied
-to the individual attempt that produced them.
+the long-lived scope around a sequence of task attempts: failed and completed
+tasks remain visible together, while agent sessions remain tied to the
+individual attempt that produced them.
 
 `rly resume <task-id>` creates a new task attempt in the same project,
 preserving the prior task and its trace as history. Use `rly run --project
@@ -178,12 +176,6 @@ inspects the repository in read-only mode and produces an implementation plan;
 that plan is then included in the prompt sent to `agy`, which performs the
 workspace changes. Both runs are persisted under the same task and appear in
 `rly trace <task-id>`.
-
-Operational hardening commands:
-
-- `rly run --max-total-tokens N ...` records a task-level token cap and stops before launch when estimated usage would exceed it.
-- `rly ops` lists blocked, failed, waiting, and aging non-terminal tasks; use `--aging 2h` or `--json` for automation.
-- `rly cancel --reason TEXT --idempotency-key KEY <task-id>` cancels active work through an actor-checked, idempotent path and records the cancellation in the task artifact.
 
 ### Multi-process orchestration
 

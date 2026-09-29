@@ -108,11 +108,12 @@ func (l LocalSemanticLayer) ObserveEvent(ctx context.Context, event agents.Event
 }
 
 func (DeterministicSemanticLayer) AnalyzeTask(_ context.Context, input SemanticTaskInput) (model.SemanticProfile, error) {
+	objectiveText := strings.ToLower(input.Objective)
 	text := strings.ToLower(input.Role + " " + input.Objective)
 	profile := model.SemanticProfile{
 		Backend:     semanticBackendDeterministic,
 		TaskKind:    inferTaskKind(input.Role, text),
-		Mutation:    impliesMutation(text),
+		Mutation:    impliesMutation(objectiveText),
 		LongRunning: containsAny(text, "long-running", "durable", "workflow", "orchestration", "temporal", "background", "daemon", "queue", "scheduler", "resume", "checkpoint"),
 		Confidence:  0.72,
 	}
@@ -150,7 +151,7 @@ func (DeterministicSemanticLayer) AnalyzeTask(_ context.Context, input SemanticT
 		"verification-failed":         {"test failed", "failing test", "build failed", "verification failed"},
 		"completion-without-evidence": {"done without", "no evidence", "unverified"},
 	})
-	profile.RequiredCapabilities = inferRequiredCapabilities(input.Role, text, profile)
+	profile.RequiredCapabilities = inferRequiredCapabilities(input.Role, objectiveText, profile)
 	profile.NeedsReview = len(profile.Risks) > 0 || containsAny(text, "review", "approval", "high-risk", "production")
 	if len(profile.Domains)+len(profile.Operations)+len(profile.Risks) >= 5 {
 		profile.Confidence = 0.84

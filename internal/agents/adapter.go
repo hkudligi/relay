@@ -90,6 +90,10 @@ type Capabilities struct {
 	Cancellation     bool `json:"cancellation"`
 	UsageReporting   bool `json:"usage_reporting"`
 	FileEditing      bool `json:"file_editing"`
+	// SingleSession marks adapters whose provider permits only one active
+	// session per account (e.g. Freebuff). Coordinators must serialize that
+	// adapter's tasks instead of fanning them out in parallel batches.
+	SingleSession bool `json:"single_session"`
 }
 
 type Request struct {
@@ -100,10 +104,6 @@ type Request struct {
 	Model        string
 	Sandbox      Sandbox
 	SkipGitCheck bool
-	// MaxTotalTokens is an optional coordinator guardrail. Adapters may ignore
-	// it; the core service and orchestrator enforce it before launch where
-	// prompt usage can be estimated.
-	MaxTotalTokens int64
 }
 
 type Usage struct {

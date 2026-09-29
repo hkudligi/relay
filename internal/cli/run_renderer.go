@@ -18,6 +18,7 @@ type runActorView struct {
 	Status  string
 	Session string
 	Detail  string
+	Result  string
 }
 
 type runRenderer struct {
@@ -101,6 +102,7 @@ func (r *runRenderer) Event(role string, event agents.Event) {
 		actor.Detail = latestProgressLine(event.Message)
 		r.renderOrPrint(role, actor.Detail)
 	case agents.EventResult:
+		result := strings.TrimSpace(event.Message)
 		detail := latestProgressLine(event.Message)
 		if detail == "" {
 			detail = strings.TrimSpace(event.Type)
@@ -110,6 +112,7 @@ func (r *runRenderer) Event(role string, event agents.Event) {
 		}
 		actor.Status = "responding"
 		actor.Detail = detail
+		actor.Result = result
 		r.renderOrPrint(role, detail)
 	case agents.EventProgress:
 		detail := latestProgressLine(event.Message)
@@ -206,11 +209,33 @@ func (r *runRenderer) Finish(state model.TaskState, session string) {
 		r.render()
 		fmt.Fprintln(r.out)
 	}
+	r.printResult()
 	fmt.Fprintf(r.out, "done    %s", state)
 	if session != "" {
 		fmt.Fprintf(r.out, " (%s)", session)
 	}
 	fmt.Fprintln(r.out)
+}
+
+func (r *runRenderer) SetResult(role, response string) {
+	if actor := r.actor(role); actor != nil && strings.TrimSpace(response) != "" {
+		actor.Result = strings.TrimSpace(response)
+	}
+}
+
+func (r *runRenderer) printResult() {
+	if r == nil || r.executor == nil {
+		return
+	}
+	result := strings.TrimSpace(r.executor.Result)
+	if result == "" {
+		return
+	}
+	fmt.Fprintln(r.out, "response")
+	fmt.Fprintln(r.out, result)
+	if !strings.HasSuffix(result, "\n") {
+		fmt.Fprintln(r.out)
+	}
 }
 
 func (r *runRenderer) Fail(err error) {

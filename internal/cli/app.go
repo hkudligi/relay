@@ -131,7 +131,6 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, or auto; freebuff is execution-only)")
 		strategy := fs.String("strategy", core.StrategyBalanced, "routing strategy: balanced, conservative, or quality-first")
 		minReserve := fs.Float64("min-reserve", 15.0, "minimum token headroom percentage to reserve before routing")
-		maxTotalTokens := fs.Int64("max-total-tokens", 0, "maximum estimated total tokens for this task")
 		projectID := fs.String("project", "", "project ID to append this task to")
 		agyWeight := fs.Float64("agy-weight", 1.0, "agent priority weight for Agy")
 		codexWeight := fs.Float64("codex-weight", 0.9, "agent priority weight for Codex")
@@ -177,7 +176,7 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 				"agy": *agyWeight, "codex": *codexWeight, "cursor": *cursorWeight, "freebuff": *freebuffWeight,
 			},
 		}
-		return a.executeObjectiveWithRouter(ctx, svc, repo, *projectID, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit, MaxTotalTokens: *maxTotalTokens}, *jsonOut)
+		return a.executeObjectiveWithRouter(ctx, svc, repo, *projectID, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit}, *jsonOut)
 	case "agents":
 		jsonOut, ok := parseJSONOnly(args[1:], a.Err)
 		if !ok {
@@ -285,53 +284,6 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 			return ExitInvalid
 		}
 		return a.executeObjectiveWithRouter(ctx, svc, repo, previous.ProjectID, previous.Objective, "", "auto", core.DefaultRoutingPolicy(), agents.Request{Sandbox: agents.SandboxWorkspaceWrite}, *jsonOut)
-	case "ops":
-		fs := flag.NewFlagSet("ops", flag.ContinueOnError)
-		fs.SetOutput(a.Err)
-		jsonOut := fs.Bool("json", false, "emit JSON")
-		aging := fs.Duration("aging", 24*time.Hour, "mark non-terminal tasks older than this duration")
-		if err := fs.Parse(args[1:]); err != nil {
-			return ExitInvalid
-		}
-		if fs.NArg() != 0 {
-			fmt.Fprintln(a.Err, "unexpected arguments")
-			return ExitInvalid
-		}
-		dashboard, err := svc.Operations(ctx, repo, *aging)
-		if err != nil {
-			return a.fail(err)
-		}
-		if *jsonOut {
-			return a.json(dashboard)
-		}
-		a.printOperations(dashboard)
-		return ExitOK
-	case "cancel":
-		fs := flag.NewFlagSet("cancel", flag.ContinueOnError)
-		fs.SetOutput(a.Err)
-		reason := fs.String("reason", "", "cancellation reason")
-		idempotencyKey := fs.String("idempotency-key", "", "idempotency key for safe retries")
-		jsonOut := fs.Bool("json", false, "emit JSON")
-		if err := fs.Parse(args[1:]); err != nil {
-			return ExitInvalid
-		}
-		if fs.NArg() != 1 {
-			fmt.Fprintln(a.Err, "rly cancel: task id is required")
-			return ExitInvalid
-		}
-		task, err := svc.CancelTask(ctx, fs.Arg(0), "user", *reason, *idempotencyKey)
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				fmt.Fprintf(a.Err, "task %s not found\n", fs.Arg(0))
-				return ExitInvalid
-			}
-			return a.fail(err)
-		}
-		if *jsonOut {
-			return a.json(task)
-		}
-		fmt.Fprintf(a.Out, "%s  %s\n", task.ID, task.State)
-		return ExitOK
 	case "memory":
 		return a.memoryCommand(ctx, svc, repo, args[1:])
 	case "trace":
@@ -363,50 +315,6 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		for _, e := range events {
 			fmt.Fprintf(a.Out, "%s  %-12s %s\n", e.CreatedAt.Local().Format("15:04:05"), e.Actor, e.Summary)
 		}
-		return ExitOK
-	case "checkpoint":
-		fs := flag.NewFlagSet("checkpoint", flag.ContinueOnError)
-		fs.SetOutput(a.Err)
-		jsonOut := fs.Bool("json", false, "emit JSON")
-		if err := fs.Parse(args[1:]); err != nil {
-			return ExitInvalid
-		}
-		if fs.NArg() != 1 {
-			fmt.Fprintln(a.Err, "rly checkpoint: task id is required")
-			return ExitInvalid
-		}
-		task, err := svc.Task(ctx, fs.Arg(0))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				fmt.Fprintf(a.Err, "task %s not found\n", fs.Arg(0))
-				return ExitInvalid
-			}
-			return a.fail(err)
-		}
-		if task.Repository != repo {
-			fmt.Fprintf(a.Err, "task %s belongs to %s\n", task.ID, task.Repository)
-			return ExitInvalid
-		}
-		path := taskCheckpointPath(*task)
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Fprintf(a.Err, "checkpoint for task %s not found at %s\n", task.ID, path)
-				return ExitInvalid
-			}
-			return a.fail(err)
-		}
-		if *jsonOut {
-			if _, err := a.Out.Write(raw); err != nil {
-				return a.fail(err)
-			}
-			return ExitOK
-		}
-		var checkpoint map[string]any
-		if err := json.Unmarshal(raw, &checkpoint); err != nil {
-			return a.fail(err)
-		}
-		a.printCheckpoint(*task, path, checkpoint)
 		return ExitOK
 	default:
 		fmt.Fprintf(a.Err, "unknown command %q; run 'rly help'\n", args[0])
@@ -748,6 +656,7 @@ func (a *App) executeObjectiveWithRouter(ctx context.Context, svc *core.Service,
 		return a.fail(runErr)
 	}
 	if renderer != nil {
+		renderer.SetResult("executor", execution.Result.Response)
 		renderer.Finish(execution.Task.State, execution.Result.SessionID)
 	}
 	return ExitOK
@@ -1046,140 +955,6 @@ func (a *App) printProjects(projects []model.Project) {
 	}
 }
 
-func (a *App) printOperations(dashboard core.OperationalDashboard) {
-	fmt.Fprintf(a.Out, "repo: %s\n", filepath.Base(dashboard.Repository))
-	if len(dashboard.Tasks) == 0 {
-		fmt.Fprintln(a.Out, "No blocked or aging tasks.")
-		return
-	}
-	fmt.Fprintln(a.Out, "Needs attention")
-	for _, task := range dashboard.Tasks {
-		fmt.Fprintf(a.Out, "%-18s %-16s %-12s %s\n", task.ID, task.State, task.Reason, task.Objective)
-	}
-}
-
-func taskCheckpointPath(task model.Task) string {
-	return filepath.Join(task.Repository, ".relay", "tasks", task.ID, "state.json")
-}
-
-func (a *App) printCheckpoint(task model.Task, path string, checkpoint map[string]any) {
-	fmt.Fprintf(a.Out, "task: %s\n", task.ID)
-	fmt.Fprintf(a.Out, "artifact: %s\n", path)
-	fmt.Fprintf(a.Out, "status: %s\n", stringValue(checkpoint["status"]))
-	fmt.Fprintf(a.Out, "phase: %s\n", stringValue(checkpoint["phase"]))
-	fmt.Fprintf(a.Out, "checkpoint: %s\n", stringValue(checkpoint["last_successful_checkpoint"]))
-	if next := stringValue(checkpoint["next_recommended_action"]); next != "" {
-		fmt.Fprintf(a.Out, "next: %s\n", next)
-	}
-	if orchestration, ok := checkpoint["orchestration"].(map[string]any); ok {
-		fmt.Fprintf(a.Out, "orchestration: %s durable=%s\n", stringValue(orchestration["backend"]), boolValue(orchestration["durable"]))
-	}
-	if operations, ok := checkpoint["operations"].(map[string]any); ok {
-		if cancellation, ok := operations["cancellation"].(map[string]any); ok && boolValue(cancellation["requested"]) == "true" {
-			fmt.Fprintf(a.Out, "cancellation: requested by %s", stringValue(cancellation["requested_by"]))
-			if reason := stringValue(cancellation["reason"]); reason != "" {
-				fmt.Fprintf(a.Out, " reason=%q", reason)
-			}
-			fmt.Fprintln(a.Out)
-		}
-	}
-	if retryLimits, ok := checkpoint["retry_limits"].(map[string]any); ok && len(retryLimits) > 0 {
-		fmt.Fprintln(a.Out, "retry chain:")
-		roles := make([]string, 0, len(retryLimits))
-		for role := range retryLimits {
-			roles = append(roles, role)
-		}
-		sort.Strings(roles)
-		for _, role := range roles {
-			limit, _ := retryLimits[role].(map[string]any)
-			fmt.Fprintf(a.Out, "  %s attempts=%s/%s\n", role, numberValue(limit["attempts"]), numberValue(limit["max_attempts"]))
-		}
-	}
-	attempts, _ := checkpoint["provider_attempts"].([]any)
-	if len(attempts) > 0 {
-		fmt.Fprintln(a.Out, "provider attempts:")
-		for _, raw := range attempts {
-			attempt, _ := raw.(map[string]any)
-			model := routeModelLabel(stringValue(attempt["model"]))
-			fmt.Fprintf(a.Out, "  #%s %s %s/%s model=%s exit=%s session=%s\n",
-				numberValue(attempt["attempt"]),
-				stringValue(attempt["status"]),
-				stringValue(attempt["role"]),
-				stringValue(attempt["adapter"]),
-				model,
-				numberValue(attempt["exit_code"]),
-				stringValue(attempt["session_id"]))
-			if errText := stringValue(attempt["error"]); errText != "" {
-				fmt.Fprintf(a.Out, "    error: %s\n", errText)
-			}
-			printTracePaths(a.Out, attempt["trace_paths"])
-			if dir := freebuffRunDir(stringValue(attempt["session_id"])); dir != "" {
-				fmt.Fprintf(a.Out, "    freebuff run: %s\n", dir)
-				fmt.Fprintf(a.Out, "    status/result/trace: %s | %s | %s\n", filepath.Join(dir, "status.md"), filepath.Join(dir, "result.md"), filepath.Join(dir, "trace.log"))
-			}
-		}
-	}
-	results, _ := checkpoint["agent_results"].([]any)
-	if len(results) > 0 {
-		latest, _ := results[len(results)-1].(map[string]any)
-		fmt.Fprintf(a.Out, "latest result: %s %s/%s", stringValue(latest["status"]), stringValue(latest["role"]), stringValue(latest["adapter"]))
-		if summary := stringValue(latest["summary"]); summary != "" {
-			fmt.Fprintf(a.Out, " - %s", summary)
-		}
-		fmt.Fprintln(a.Out)
-	}
-}
-
-func printTracePaths(out io.Writer, raw any) {
-	paths, _ := raw.([]any)
-	for _, path := range paths {
-		if value := stringValue(path); value != "" {
-			fmt.Fprintf(out, "    trace: %s\n", value)
-		}
-	}
-}
-
-func freebuffRunDir(sessionID string) string {
-	if !strings.HasPrefix(sessionID, "freebuff:") {
-		return ""
-	}
-	return strings.TrimPrefix(sessionID, "freebuff:")
-}
-
-func stringValue(v any) string {
-	if v == nil {
-		return ""
-	}
-	switch value := v.(type) {
-	case string:
-		return value
-	case fmt.Stringer:
-		return value.String()
-	default:
-		return fmt.Sprint(value)
-	}
-}
-
-func numberValue(v any) string {
-	if v == nil {
-		return "0"
-	}
-	switch value := v.(type) {
-	case float64:
-		return fmt.Sprintf("%.0f", value)
-	default:
-		return fmt.Sprint(value)
-	}
-}
-
-func boolValue(v any) string {
-	value, _ := v.(bool)
-	if value {
-		return "true"
-	}
-	return "false"
-}
-
 func (a *App) memoryCommand(ctx context.Context, svc *core.Service, repo string, args []string) int {
 	if len(args) > 0 && args[0] == "set" {
 		if len(args) < 3 {
@@ -1247,13 +1022,10 @@ Usage:
   rly [--state PATH] projects [--json]
   rly [--state PATH] project [--json] <project-id>
   rly [--state PATH] resume [--json] <task-id>
-  rly [--state PATH] ops [--aging DURATION] [--json]
-  rly [--state PATH] cancel [--reason TEXT] [--idempotency-key KEY] [--json] <task-id>
   rly [--state PATH] memory [--json]
   rly [--state PATH] memory set <key> <value>
   rly [--state PATH] memory delete <key>
   rly [--state PATH] trace [--json] <task-id>
-  rly [--state PATH] checkpoint [--json] <task-id>
   rly help
 
 In the REPL, enter an objective to run it automatically optimized for token
@@ -1271,8 +1043,6 @@ Run options:
                             quota in reserve; auto-routing skips agents below
                             the threshold unless no higher-headroom agent is
                             eligible.
-  --max-total-tokens N      Stop before launch when estimated task usage would
-                            exceed this task-level token limit.
 `)
 }
 
