@@ -64,12 +64,12 @@ func startTUI(command, workspace string) (*tuiSession, error) {
 		} else {
 			tmuxErr = err
 		}
+	} else {
+		tmuxErr = fmt.Errorf("tmux not found: %w", err)
 	}
-	/*
-	if runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" && tmuxErr != nil {
-		return nil, fmt.Errorf("start visible Freebuff tmux session: %w", tmuxErr)
-	}
-	*/	
+	// The visible client is only a mirror.  It must never make the actual
+	// adapter unusable when tmux is unavailable (for example in CI or on a
+	// machine where Terminal is not running).
 	session, err := startPTYTUI(command, workspace)
 	if session != nil && tmuxErr != nil {
 		session.startupWarning = tmuxErr.Error()
@@ -87,30 +87,68 @@ func startTmuxTUI(tmux, command, workspace string) (*tuiSession, error) {
 	if output, err := create.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("create tmux session: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	attach := exec.Command(tmux, "-L", socket, "attach-session", "-t", name)
-	attach.Env = env
-	attach.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	newAttach := func(withProcessGroup bool) *exec.Cmd {
+		attach := exec.Command(tmux, "-L", socket, "attach-session", "-t", name)
+		attach.Env = env
+		if withProcessGroup {
+			attach.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		}
+		return attach
+	}
+	processGroup := true
+	attach := newAttach(processGroup)
 	ptmx, err := pty.Start(attach)
+	if err != nil && errors.Is(err, syscall.EPERM) && visibleFreebuffMirrorEnabled() {
+		// macOS sandboxing can reject setpgid for a tmux client even though the
+		// tmux server and session started successfully. The process group is a
+		// cleanup optimization; do not lose the visible mirror over it.
+		processGroup = false
+		attach = newAttach(false)
+		ptmx, err = pty.Start(attach)
+	}
 	if err != nil {
-		_ = exec.Command(tmux, "kill-session", "-t", name).Run()
+		_ = exec.Command(tmux, "-L", socket, "kill-session", "-t", name).Run()
 		return nil, fmt.Errorf("attach tmux session: %w", err)
 	}
-	s := newTUISession(attach, ptmx, true)
+	s := newTUISession(attach, ptmx, processGroup)
 	s.tmux, s.tmuxSocket, s.tmuxSession = tmux, socket, name
 	// Keep rly's PTY as the controller, but give the user a read-only Terminal
 	// client so the complete Freebuff screen, including ads and provider state,
 	// remains visible during the run.
-	if runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" {
+	if visibleFreebuffMirrorEnabled() {
 		s.visibleMirrorErr = openVisibleTmuxMirror(tmux, socket, name)
 	}
 	s.startWatchers()
 	return s, nil
 }
 
+func visibleFreebuffMirrorEnabled() bool {
+	return runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0"
+}
+
 func openVisibleTmuxMirror(tmux, socket, session string) error {
-	attach := fmt.Sprintf("%s -L %s attach-session -r -t %s; printf '\\nFreebuff run finished. Press return to close this tab...'; read _", shellQuote(tmux), shellQuote(socket), shellQuote(session))
+	// The read happens only after the read-only tmux client returns. Return is
+	// therefore consumed by this Terminal shell, not sent into Freebuff. Exit
+	// explicitly after the acknowledgement so the tab can close according to
+	// the Terminal profile's shell-exit setting.
+	attach := fmt.Sprintf("%s -L %s attach-session -r -t %s || true; printf '\\nFreebuff run finished. Press return to close this tab...'; IFS= read -r _ </dev/tty; exit", shellQuote(tmux), shellQuote(socket), shellQuote(session))
 	command := "exec /bin/sh -lc " + shellQuote(attach)
-	appleScript := fmt.Sprintf(`tell application "Terminal"
+	appleScript := visibleTmuxMirrorAppleScript(command)
+	cmd := exec.Command("osascript", "-e", appleScript)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("open visible Freebuff Terminal tab: %w", err)
+	}
+	go func() { _ = cmd.Wait() }()
+	return nil
+}
+
+func visibleTmuxMirrorAppleScript(command string) string {
+	quoted := appleScriptQuote(command)
+	// Terminal's native `do script ... in front window` is version-dependent:
+	// on some releases it runs in the selected tab instead of creating one.
+	// Cmd-T is the stable tab-creation operation; after it completes, target
+	// the selected tab so the command cannot land in the caller's shell.
+	return fmt.Sprintf(`tell application "Terminal"
 	activate
 	if (count of windows) = 0 then
 		do script "%s"
@@ -118,16 +156,11 @@ func openVisibleTmuxMirror(tmux, socket, session string) error {
 		tell application "System Events" to tell process "Terminal"
 			keystroke "t" using command down
 		end tell
-		delay 0.75
-		do script "%s" in front window
+		delay 0.5
+		do script "%s" in selected tab of front window
 	end if
 	activate
-end tell`, appleScriptQuote(command), appleScriptQuote(command))
-	output, err := exec.Command("osascript", "-e", appleScript).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("open visible Freebuff Terminal tab: %w: %s", err, strings.TrimSpace(string(output)))
-	}
-	return nil
+end tell`, quoted, quoted)
 }
 
 func shellQuote(value string) string {
@@ -226,12 +259,23 @@ func (s *tuiSession) inactiveFor() time.Duration {
 }
 
 func (s *tuiSession) sendKeys(value string) error {
+	// The controller already owns a writable tmux client PTY. Write to that
+	// PTY directly instead of starting a second tmux client for every chunk.
+	// The latter can fail when a read-only observer is attached, even though
+	// the controller session itself is healthy.
+	if s.ptmx != nil {
+		if _, err := s.ptmx.Write([]byte(value)); err == nil {
+			return nil
+		}
+	}
 	if s.tmux == "" {
-		_, err := s.ptmx.Write([]byte(value))
-		return err
+		return errors.New("write Freebuff controller PTY failed")
 	}
 	cmd := s.tmuxCommand("send-keys", "-t", s.tmuxSession, "-l", value)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *tuiSession) sessionAlive() bool {
