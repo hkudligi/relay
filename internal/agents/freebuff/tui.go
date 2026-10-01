@@ -65,9 +65,11 @@ func startTUI(command, workspace string) (*tuiSession, error) {
 			tmuxErr = err
 		}
 	}
+	/*
 	if runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" && tmuxErr != nil {
 		return nil, fmt.Errorf("start visible Freebuff tmux session: %w", tmuxErr)
 	}
+	*/	
 	session, err := startPTYTUI(command, workspace)
 	if session != nil && tmuxErr != nil {
 		session.startupWarning = tmuxErr.Error()

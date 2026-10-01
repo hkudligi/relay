@@ -1,8 +1,10 @@
 # rly
-`rly` is a local conversational runtime for coordinating coding-agent CLIs. The
-current Phase 1 slice includes a repository-aware CLI/REPL, durable SQLite task
-state, durable project memory, an append-only trace, and streaming adapters for Codex, Cursor (`agent` / `cursor-agent`), Google
-Antigravity (`agy`), and Freebuff (`freebuff`).
+
+`rly` is a local conversational runtime for coordinating coding-agent CLIs. It
+provides a repository-aware CLI/REPL, durable SQLite task state, durable project
+memory, an append-only trace, token-availability routing with a lightweight
+semantic layer, and streaming adapters for Codex, Cursor (`agent` /
+`cursor-agent`), Google Antigravity (`agy`), and Freebuff (`freebuff`).
 
 ## Build and try it
 
@@ -24,7 +26,7 @@ Useful commands:
 ```sh
 ./rly run "fix the flaky test"
 ./rly run --agent cursor "review the current package"
-./rly run --planner cursor --agent agy "implement the planned feature"
+./rly run --planner codex --agent agy "implement the planned feature"
 ./rly run --agent freebuff "add a lint rule and fix violations"
 ./rly agents
 ./rly agents --json
@@ -40,10 +42,6 @@ Useful commands:
 ./rly status --json
 ```
 
-Implementation details for task classification, routing effects, lexical
-matching, orchestration hints, examples, and current limitations are in
-[`semantic-layer.md`](semantic-layer.md).
-
 State is stored in `~/.rly/state.db` by default. Use `--state PATH` before the
 subcommand to select another database.
 
@@ -58,15 +56,16 @@ individual attempt that produced them.
 preserving the prior task and its trace as history. Use `rly run --project
 <project-id> "..."` to append a deliberate follow-up attempt to a project.
 
-Human-readable `rly run` commands execute supported agents headlessly and render
-a compact live status view through `rly`; runs do not open additional Terminal
-tabs. `--json` keeps the machine-readable output unchanged.
+Human-readable `rly run` commands execute the routed agents headlessly and
+render a compact live status view through `rly`; runs do not open additional
+Terminal tabs. `--json` keeps the machine-readable output unchanged.
 
 ## Conversational REPL
 
 Run `./rly` with no subcommand to open the repository-aware REPL. Any input that
-is not a recognized command is immediately executed as a task by the default
-Codex adapter with `workspace-write` sandboxing, just like `rly run`:
+is not a recognized command is immediately executed as a task by the
+token-availability router, which picks the planning and execution agents
+automatically, just like `rly run`:
 
 ```text
 $ ./rly
@@ -75,16 +74,17 @@ repo: relay
 
 › fix the flaky cache test
 rly run task-...  PLANNING
-models  codex/gpt-5.6-sol UNKNOWN ready
-exec    codex (gpt-5.6-sol)
-executor codex (gpt-5.6-sol) running
-executor ...streamed Codex response...
+models     codex/gpt-5.6-sol UNKNOWN ready | agy/... UNKNOWN ready
+executor   queued agy (…) - routed by token availability and efficacy
+planner    queued agy (…)
+executor   codex (gpt-5.6-sol) running
+executor   ...streamed response...
 done    COMPLETED (session-id)
 ```
 
 REPL executions show the same compact status surface and persist the same task
 state, run result, upstream session, project-memory updates, and trace events as
-`rly run`. An unavailable Codex installation or a failed run is reported on
+`rly run`. An unavailable agent installation or a failed run is reported on
 standard error; the REPL stays open so status can be inspected or another task
 can be entered.
 
@@ -101,8 +101,8 @@ The inventory is recorded as the `agent.inventory_discovered` event before the
 task's `PLANNING` transition. `rly trace --json <task-id>` returns the full
 structured inventory in that event. `rly agents --json` returns the current
 inventory directly, while `rly run --json ...` returns an object containing
-both `inventory` and `execution` (or `task` and `error` when execution cannot
-start).
+`inventory`, `routing`, and `execution` (or `task` and `error` when execution
+cannot start).
 
 The following inputs are handled as commands and never create tasks:
 
@@ -136,11 +136,14 @@ up to 80 bytes using letters, digits, `.`, `-`, or `_`; values are limited to
 architectural constraints, and chosen conventions—not secrets, guesses, task
 progress, or full transcripts.
 
-Codex is the default adapter. Both integrations use their machine-readable
-streaming modes, retain the upstream session ID, normalize usage, and propagate
-cancellation. Use `--sandbox read-only` for analysis-only tasks; mutation tasks
-default to `workspace-write`. `rly run` returns exit code `4` when the selected CLI
-is not installed or cannot report its version.
+Routing chooses the execution agent automatically, weighing capability fit,
+session context, quota headroom, reliability, cost, and per-agent priority
+weights (`agy` 1.0, `codex` 0.9, `cursor` 0.8, `freebuff` 0.0 by default). Both
+integrations use their machine-readable streaming modes, retain the upstream
+session ID, normalize usage, and propagate cancellation. Use `--sandbox
+read-only` for analysis-only tasks; mutation tasks default to
+`workspace-write`. `rly run` returns exit code `4` when the selected CLI is not
+installed or cannot report its version.
 
 ### Freebuff adapter
 
@@ -171,11 +174,12 @@ published Freebuff model IDs with `remaining=UNKNOWN`; quota remains denied by
 the default routing policy unless another measured provider fails first, in
 which case Freebuff participates in recovery routing.
 
-To use two agents for one task, pass `--planner codex --agent agy` (or `--planner auto --agent auto`). Codex
-inspects the repository in read-only mode and produces an implementation plan;
-that plan is then included in the prompt sent to `agy`, which performs the
-workspace changes. Both runs are persisted under the same task and appear in
-`rly trace <task-id>`.
+To use two agents for one task, pass `--planner codex --agent agy` (or
+`--planner auto --agent auto`). The planner inspects the repository in
+read-only mode and produces an implementation plan; that plan is then included
+in the prompt sent to the executor, which performs the workspace changes. Both
+runs are persisted under the same task and appear in `rly trace <task-id>`.
+Freebuff is execution-only and is rejected as a planner.
 
 ### Multi-process orchestration
 
@@ -194,20 +198,30 @@ vendor-neutral.
 
 ## Token availability & efficacy routing
 
-`rly` includes an explainable multi-agent router that optimizes execution based on token availability and agent efficacy:
+`rly` includes an explainable multi-agent router that optimizes execution based
+on token availability and agent efficacy:
 
-- **Token & quota optimization**: Discovers live provider rate limits and quota headroom. Agents with exhausted quota (`0%`) or below reserve thresholds are automatically protected and deprioritized or excluded.
-- **Efficacy & role matching**: Routes tasks to specialists based on role fit (e.g. `agy` for planning, analysis, and architecture; `codex` for code implementation, test writing, and refactoring).
+- **Token & quota optimization**: Discovers live provider rate limits and quota
+  headroom. Agents with exhausted quota (`0%`) or below reserve thresholds are
+  automatically protected and deprioritized or excluded.
+- **Efficacy & role matching**: Routes tasks to specialists based on role fit
+  (e.g. `agy` for planning, analysis, and architecture; `codex` for code
+  implementation, test writing, and refactoring).
 - **Routing strategies**:
-  - `balanced` (default): Blends capability fit, session context, quota headroom, and reliability.
-  - `conservative`: Prioritizes token conservation and headroom over minor capability differences.
+  - `balanced` (default): Blends capability fit, session context, quota
+    headroom, and reliability.
+  - `conservative`: Prioritizes token conservation and headroom over minor
+    capability differences.
   - `quality-first`: Prioritizes maximum capability and efficacy fit.
-- **Trace observability**: Every routing decision, rationale, and candidate score breakdown is recorded as a `routing.selected` trace event and exposed via `rly trace --json` and `rly run --json`.
+- **Trace observability**: Every routing decision, rationale, and candidate
+  score breakdown is recorded as a `routing.selected` trace event and exposed
+  via `rly trace --json` and `rly run --json`.
 
-Routing decisions also include a provider-neutral semantic profile for the task,
-with task kind, domains, operations, risks, required capabilities, and review
-signals. See [semantic-layer.md](semantic-layer.md) for the semantic routing and
-monitoring blueprint.
-
-See [rly-product-technical-spec.md](rly-product-technical-spec.md) for the full
-product and technical specification.
+Routing decisions also include a provider-neutral semantic profile for the
+task, with task kind, domains, operations, risks, required capabilities, and
+review signals. The semantic layer merges deterministic rules with lightweight
+in-process lexical example matching; it records `semantic.assessed` events,
+attaches semantic profiles to `routing.selected` events, and feeds
+long-running/signals hints into orchestration. Richer embedding, BERT, or
+micro-LLM backends remain future options behind the same semantic-layer
+contract.
