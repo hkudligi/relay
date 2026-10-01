@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -126,6 +127,9 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ContinueOnError)
 		fs.SetOutput(a.Err)
+		// Keep the trust flag usable after the objective as well as before it;
+		// users commonly copy Codex's flag spelling from its error message.
+		runArgs := moveRunTrustFlags(args[1:])
 		jsonOut := fs.Bool("json", false, "emit JSON")
 		agentName := fs.String("agent", "auto", "agent adapter (codex, agy, cursor, freebuff, or auto)")
 		plannerName := fs.String("planner", "", "planning adapter to run before the executor (codex, agy, cursor, or auto; freebuff is execution-only)")
@@ -137,8 +141,10 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		cursorWeight := fs.Float64("cursor-weight", 0.8, "agent priority weight for Cursor")
 		freebuffWeight := fs.Float64("freebuff-weight", 0.1, "agent priority weight for Freebuff")
 		sandbox := fs.String("sandbox", string(agents.SandboxWorkspaceWrite), "sandbox mode (read-only or workspace-write)")
-		skipGit := fs.Bool("skip-git-check", false, "allow Codex outside a Git repository")
-		if err := fs.Parse(args[1:]); err != nil {
+		var skipGit bool
+		fs.BoolVar(&skipGit, "skip-git-check", false, "allow Codex outside a Git repository")
+		fs.BoolVar(&skipGit, "skip-git-repo-check", false, "alias for --skip-git-check")
+		if err := fs.Parse(runArgs); err != nil {
 			return ExitInvalid
 		}
 		objective := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -167,6 +173,10 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 			fmt.Fprintf(a.Err, "invalid sandbox %q\n", *sandbox)
 			return ExitInvalid
 		}
+		// Codex rejects standalone project directories before it can read the
+		// prompt. Automatically bypass that check only when Git confirms this
+		// workspace is not a repository; the explicit flags remain supported.
+		skipGit = skipGit || !isGitRepository(ctx, repo)
 		policy := core.RoutingPolicy{
 			Strategy:           *strategy,
 			MinReservePercent:  *minReserve,
@@ -176,7 +186,7 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 				"agy": *agyWeight, "codex": *codexWeight, "cursor": *cursorWeight, "freebuff": *freebuffWeight,
 			},
 		}
-		return a.executeObjectiveWithRouter(ctx, svc, repo, *projectID, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: *skipGit}, *jsonOut)
+		return a.executeObjectiveWithRouter(ctx, svc, repo, *projectID, objective, *plannerName, *agentName, policy, agents.Request{Sandbox: mode, SkipGitCheck: skipGit}, *jsonOut)
 	case "agents":
 		jsonOut, ok := parseJSONOnly(args[1:], a.Err)
 		if !ok {
@@ -320,6 +330,24 @@ func (a *App) command(ctx context.Context, svc *core.Service, repo string, args 
 		fmt.Fprintf(a.Err, "unknown command %q; run 'rly help'\n", args[0])
 		return ExitInvalid
 	}
+}
+
+func moveRunTrustFlags(args []string) []string {
+	var flags []string
+	var rest []string
+	for _, arg := range args {
+		if arg == "--skip-git-check" || arg == "--skip-git-repo-check" {
+			flags = append(flags, arg)
+			continue
+		}
+		rest = append(rest, arg)
+	}
+	return append(flags, rest...)
+}
+
+func isGitRepository(ctx context.Context, repo string) bool {
+	check := exec.CommandContext(ctx, "git", "-C", repo, "rev-parse", "--git-dir")
+	return check.Run() == nil
 }
 
 func (a *App) repl(ctx context.Context, svc *core.Service, repo string) int {

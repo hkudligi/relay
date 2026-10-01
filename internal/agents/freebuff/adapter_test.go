@@ -12,6 +12,12 @@ import (
 	"github.com/harsha/relay/internal/agents/freebuff"
 )
 
+func TestMain(m *testing.M) {
+	// Unit tests do not need to launch macOS Terminal tabs.
+	_ = os.Setenv("RLY_FREEBUFF_VISIBLE", "0")
+	os.Exit(m.Run())
+}
+
 // fakeFreebuff installs a shell script named "freebuff" that mimics the real
 // TUI's observable behavior for the adapter contract: it prints an input
 // frame (readiness), then — once the pasted pointer names prompt.md — reads
@@ -70,7 +76,21 @@ func TestStartRunsTaskThroughFileChannel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for range run.Events() {
+	sawRunID := false
+	for event := range run.Events() {
+		if event.Type != "freebuff.run.started" {
+			continue
+		}
+		if event.Message == "" || event.Data["run_id"] == "" || event.Data["channel_dir"] == "" {
+			t.Fatalf("run event = %+v, want run id and channel directory", event)
+		}
+		if !strings.HasPrefix(event.Message, "run run-") {
+			t.Fatalf("run message = %q, want run-* identifier", event.Message)
+		}
+		sawRunID = true
+	}
+	if !sawRunID {
+		t.Fatal("expected freebuff run identifier event")
 	}
 	result := run.Wait()
 	if result.Err != nil {
@@ -111,6 +131,9 @@ func TestStartStreamsStatusProgress(t *testing.T) {
 	for event := range run.Events() {
 		switch event.Kind {
 		case agents.EventProgress:
+			if event.Type == "freebuff.run.started" {
+				continue
+			}
 			if event.Type != "status.md" {
 				t.Fatalf("progress type = %q, want status.md", event.Type)
 			}

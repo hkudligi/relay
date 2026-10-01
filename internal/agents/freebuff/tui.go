@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,22 +22,25 @@ import (
 // pastes a short pointer at the channel prompt.md, and dismisses the initial
 // "Take over / Exit" instance-lock dialog if it appears.
 type tuiSession struct {
-	cmd          *exec.Cmd
-	ptmx         *os.File
-	ready        chan struct{}
-	readyOnce    sync.Once
-	waitExit     chan error
-	fatal        chan error
-	activity     chan struct{}
-	mu           sync.Mutex
-	transcript   strings.Builder
-	written      bool
-	cancelOnce   sync.Once
-	processGroup bool
-	tmux         string
-	tmuxSession  string
-	readyMode    string
-	lastOutput   time.Time
+	cmd              *exec.Cmd
+	ptmx             *os.File
+	ready            chan struct{}
+	readyOnce        sync.Once
+	waitExit         chan error
+	fatal            chan error
+	activity         chan struct{}
+	mu               sync.Mutex
+	transcript       strings.Builder
+	written          bool
+	cancelOnce       sync.Once
+	processGroup     bool
+	tmux             string
+	tmuxSocket       string
+	tmuxSession      string
+	visibleMirrorErr error
+	startupWarning   string
+	readyMode        string
+	lastOutput       time.Time
 }
 
 var (
@@ -53,23 +57,35 @@ var (
 // Freebuff's argument parser has no prompt argument, so the TUI opens on its
 // chat screen and rly pastes the task pointer afterwards.
 func startTUI(command, workspace string) (*tuiSession, error) {
+	var tmuxErr error
 	if tmux, err := exec.LookPath("tmux"); err == nil {
 		if session, err := startTmuxTUI(tmux, command, workspace); err == nil {
 			return session, nil
+		} else {
+			tmuxErr = err
 		}
 	}
-	return startPTYTUI(command, workspace)
+	if runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" && tmuxErr != nil {
+		return nil, fmt.Errorf("start visible Freebuff tmux session: %w", tmuxErr)
+	}
+	session, err := startPTYTUI(command, workspace)
+	if session != nil && tmuxErr != nil {
+		session.startupWarning = tmuxErr.Error()
+	}
+	return session, err
 }
 
 func startTmuxTUI(tmux, command, workspace string) (*tuiSession, error) {
 	name := fmt.Sprintf("rly-freebuff-%d", time.Now().UnixNano())
+	socket := fmt.Sprintf("rly-%d", time.Now().UnixNano())
 	env := append(os.Environ(), "TERM=xterm-256color", "NO_COLOR=", "CI=")
-	create := exec.Command(tmux, "new-session", "-d", "-s", name, "-c", filepath.Clean(workspace), command, "--cwd", workspace)
+	createArgs := []string{"-L", socket, "new-session", "-d", "-s", name, "-c", filepath.Clean(workspace), command, "--cwd", workspace}
+	create := exec.Command(tmux, createArgs...)
 	create.Env = env
 	if output, err := create.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("create tmux session: %w: %s", err, strings.TrimSpace(string(output)))
 	}
-	attach := exec.Command(tmux, "attach-session", "-t", name)
+	attach := exec.Command(tmux, "-L", socket, "attach-session", "-t", name)
 	attach.Env = env
 	attach.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	ptmx, err := pty.Start(attach)
@@ -78,9 +94,47 @@ func startTmuxTUI(tmux, command, workspace string) (*tuiSession, error) {
 		return nil, fmt.Errorf("attach tmux session: %w", err)
 	}
 	s := newTUISession(attach, ptmx, true)
-	s.tmux, s.tmuxSession = tmux, name
+	s.tmux, s.tmuxSocket, s.tmuxSession = tmux, socket, name
+	// Keep rly's PTY as the controller, but give the user a read-only Terminal
+	// client so the complete Freebuff screen, including ads and provider state,
+	// remains visible during the run.
+	if runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" {
+		s.visibleMirrorErr = openVisibleTmuxMirror(tmux, socket, name)
+	}
 	s.startWatchers()
 	return s, nil
+}
+
+func openVisibleTmuxMirror(tmux, socket, session string) error {
+	attach := fmt.Sprintf("%s -L %s attach-session -r -t %s; printf '\\nFreebuff run finished. Press return to close this tab...'; read _", shellQuote(tmux), shellQuote(socket), shellQuote(session))
+	command := "exec /bin/sh -lc " + shellQuote(attach)
+	appleScript := fmt.Sprintf(`tell application "Terminal"
+	activate
+	if (count of windows) = 0 then
+		do script "%s"
+	else
+		tell application "System Events" to tell process "Terminal"
+			keystroke "t" using command down
+		end tell
+		delay 0.75
+		do script "%s" in front window
+	end if
+	activate
+end tell`, appleScriptQuote(command), appleScriptQuote(command))
+	output, err := exec.Command("osascript", "-e", appleScript).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("open visible Freebuff Terminal tab: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func appleScriptQuote(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return strings.ReplaceAll(value, `"`, `\"`)
 }
 
 func startPTYTUI(command, workspace string) (*tuiSession, error) {
@@ -174,7 +228,7 @@ func (s *tuiSession) sendKeys(value string) error {
 		_, err := s.ptmx.Write([]byte(value))
 		return err
 	}
-	cmd := exec.Command(s.tmux, "send-keys", "-t", s.tmuxSession, "-l", value)
+	cmd := s.tmuxCommand("send-keys", "-t", s.tmuxSession, "-l", value)
 	return cmd.Run()
 }
 
@@ -185,7 +239,7 @@ func (s *tuiSession) sessionAlive() bool {
 		}
 		return s.cmd.Process.Signal(syscall.Signal(0)) == nil
 	}
-	return exec.Command(s.tmux, "has-session", "-t", s.tmuxSession).Run() == nil
+	return s.tmuxCommand("has-session", "-t", s.tmuxSession).Run() == nil
 }
 
 func (s *tuiSession) exitCode() int {
@@ -201,7 +255,7 @@ func (s *tuiSession) paneSnapshot() string {
 	if s.tmux == "" {
 		return s.diagnostic()
 	}
-	output, err := exec.Command(s.tmux, "capture-pane", "-p", "-t", s.tmuxSession).CombinedOutput()
+	output, err := s.tmuxCommand("capture-pane", "-p", "-t", s.tmuxSession).CombinedOutput()
 	if err != nil {
 		return fmt.Sprintf("tmux capture failed: %v", err)
 	}
@@ -347,7 +401,7 @@ func (s *tuiSession) writeLines(text string) error {
 func (s *tuiSession) cancel() error {
 	s.cancelOnce.Do(func() {
 		if s.tmux != "" {
-			_ = exec.Command(s.tmux, "kill-session", "-t", s.tmuxSession).Run()
+			_ = s.tmuxCommand("kill-session", "-t", s.tmuxSession).Run()
 		}
 		if s.ptmx != nil {
 			// Ctrl-C first so the TUI can shut down cleanly, then close the PTY.
@@ -364,6 +418,14 @@ func (s *tuiSession) cancel() error {
 		}
 	})
 	return nil
+}
+
+func (s *tuiSession) tmuxCommand(args ...string) *exec.Cmd {
+	if s.tmuxSocket == "" {
+		return exec.Command(s.tmux, args...)
+	}
+	commandArgs := append([]string{"-L", s.tmuxSocket}, args...)
+	return exec.Command(s.tmux, commandArgs...)
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)

@@ -69,7 +69,9 @@ func startProcess(parent context.Context, command string, args []string, dir str
 	ctx, cancel := context.WithCancel(parent)
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = dir
-	cmd.Stdin = bytes.NewReader(nil)
+	// Leave stdin nil so exec connects the child to the null device. An
+	// explicit empty pipe still looks like piped input to CLIs such as Codex,
+	// which then try to append a second prompt from stdin.
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()

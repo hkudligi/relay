@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,9 @@ const (
 	freebuffStartupIdleTimeout = 2 * time.Minute
 	freebuffIdleTimeout        = 10 * time.Minute
 	freebuffMaxRuntime         = 45 * time.Minute
+	// A long wall-clock gap means macOS likely suspended the process while the
+	// laptop slept. Do not spend that interval on agent watchdog deadlines.
+	freebuffWakeGap = 2 * time.Minute
 )
 
 // New builds an adapter. An empty command falls back to the standard
@@ -116,6 +121,16 @@ func (a *Adapter) run(ctx context.Context, r agents.Request) (agents.Run, error)
 		return nil, err
 	}
 	ch.trace("tui.started")
+	if session.tmux == "" {
+		ch.trace("tui.mode mode=pty warning=%q", session.startupWarning)
+	} else {
+		ch.trace("tui.mode mode=tmux session=%q", session.tmuxSession)
+	}
+	if session.visibleMirrorErr != nil {
+		ch.trace("visible_terminal.error error=%q", session.visibleMirrorErr)
+	} else if session.tmux != "" && runtime.GOOS == "darwin" && os.Getenv("RLY_FREEBUFF_VISIBLE") != "0" {
+		ch.trace("visible_terminal.started tmux_session=%q mode=read-only", session.tmuxSession)
+	}
 
 	// The task pointer pasted into the TUI stays short: the full brief lives
 	// in prompt.md where the agent reads it with file tools. A one-line paste
@@ -186,8 +201,19 @@ func (r *run) loop(ctx context.Context) {
 	var offset int64
 	started := time.Now()
 	r.ch.trace("run.loop.started handoff_required=%t file_state=%s", r.handoffRequired, r.ch.fileState())
+	r.emit(ctx, agents.Event{
+		Kind:    agents.EventProgress,
+		Type:    "freebuff.run.started",
+		Message: "run " + filepath.Base(r.ch.Dir),
+		Data: map[string]any{
+			"run_id":      filepath.Base(r.ch.Dir),
+			"channel_dir": r.ch.Dir,
+		},
+		Time: time.Now().UTC(),
+	})
 	lastActivity := started
 	lastHeartbeat := started
+	lastWallClock := time.Now().UTC()
 	var pendingFileResult string
 	submitted := false
 	acceptedLogged := false
@@ -251,6 +277,13 @@ func (r *run) loop(ctx context.Context) {
 			lastActivity = time.Now()
 		case <-ticker.C:
 			now := time.Now()
+			wallNow := time.Now().UTC()
+			if wallGap := wallNow.Sub(lastWallClock); wallGap >= freebuffWakeGap {
+				started, lastActivity, lastHeartbeat = resetWatchdogsAfterSleep(started, lastActivity, lastHeartbeat, now, wallGap)
+				r.ch.trace("system.wake detected sleep_gap=%s file_state=%s tui_alive=%t", wallGap.Round(time.Second), r.ch.fileState(), r.session.sessionAlive())
+				r.emit(ctx, agents.Event{Kind: agents.EventProgress, Type: "system.wake", Message: fmt.Sprintf("resuming after %s sleep", wallGap.Round(time.Second)), Data: map[string]any{"sleep_gap": wallGap.String()}, Time: time.Now().UTC()})
+			}
+			lastWallClock = wallNow
 			if !r.session.sessionAlive() {
 				err := fmt.Errorf("freebuff TUI session disappeared; pane=%q", clipDiagnostic(r.session.paneSnapshot()))
 				r.ch.trace("tui.session.disappeared error=%q file_state=%s diagnostic=%q", err, r.ch.fileState(), clipDiagnostic(r.session.diagnostic()))
@@ -316,6 +349,13 @@ func (r *run) loop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func resetWatchdogsAfterSleep(started, lastActivity, lastHeartbeat, now time.Time, sleepGap time.Duration) (time.Time, time.Time, time.Time) {
+	if sleepGap < freebuffWakeGap {
+		return started, lastActivity, lastHeartbeat
+	}
+	return started.Add(sleepGap), now, now
 }
 
 // emitStatus tails new status.md content once per poll and emits it as a
